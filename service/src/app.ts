@@ -5,6 +5,7 @@ import type { Clock } from "./clock";
 import type { Config } from "./config";
 import { openDb } from "./db";
 import type { GitHub, Issue, Repo } from "./github";
+import type { AuthCheckState, Harness, SetupView } from "./harness";
 import { JOB_STATES, type Job, UNTRUSTED_AUTHOR } from "./jobs";
 
 const PAGE_SIZE = 50;
@@ -26,8 +27,13 @@ function candidateSkipReason(issue: Issue): (typeof FILTER_REASONS)[number] | nu
   return null;
 }
 
-export function createApp(deps: { config: Config; github: GitHub; clock: Clock }) {
-  const { config, github, clock } = deps;
+const PAUSE_REASONS: Partial<Record<AuthCheckState, string>> = {
+  auth: "Harness auth failed: log in again as the setup page shows, then click Test auth.",
+  quota: "Harness quota exhausted: wait for it to reset, then click Test auth.",
+};
+
+export function createApp(deps: { config: Config; github: GitHub; clock: Clock; harnesses: Harness[] }) {
+  const { config, github, clock, harnesses } = deps;
   const db = openDb(config.dbPath);
   const iso = (ms: number) => new Date(ms).toISOString();
 
@@ -46,6 +52,25 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock }
   const liftSkip = db.query(`UPDATE jobs SET state = ?1, skip_reason = ?2, updated_at = ?3
     WHERE repo_id = ?4 AND issue_number = ?5 AND ${filterSkipped}`);
   const getJob = db.query<Job, [number]>("SELECT * FROM jobs WHERE id = ?");
+
+  const getSettingQuery = db.query<{ value: string }, [string]>("SELECT value FROM settings WHERE key = ?");
+  const getSetting = <T>(key: string): T | null => {
+    const row = getSettingQuery.get(key);
+    return row ? JSON.parse(row.value) : null;
+  };
+  const setSettingQuery = db.query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value");
+  const setSetting = (key: string, value: unknown) => setSettingQuery.run(key, JSON.stringify(value));
+  const deleteSettingQuery = db.query("DELETE FROM settings WHERE key = ?");
+  const deleteSetting = (key: string) => deleteSettingQuery.run(key);
+
+  // Tracks when each harness credential was first seen, by hash, so the setup page can show its age.
+  for (const harness of harnesses) {
+    if (!harness.credential) continue;
+    const hash = new Bun.CryptoHasher("sha256").update(harness.credential).digest("hex");
+    if (getSetting<{ hash: string }>(`credential:${harness.name}`)?.hash !== hash) {
+      setSetting(`credential:${harness.name}`, { hash, since: iso(clock.now()) });
+    }
+  }
 
   /** Records one scan's results: every successfully listed repo, committed together so jobs are numbered oldest issue first. */
   function record(scanned: ScannedRepo[], scanStart: number) {
@@ -146,6 +171,41 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock }
     if (runAnyway.run(iso(clock.now()), id, UNTRUSTED_AUTHOR).changes) return c.json(getJob.get(id), 202);
     if (!getJob.get(id)) return c.json({ error: "Job not found" }, 404);
     return c.json({ error: `Run anyway only applies to jobs skipped as ${UNTRUSTED_AUTHOR}` }, 409);
+  });
+
+  function setupView(): SetupView {
+    const harness = getSetting<string>("harness");
+    return {
+      harness,
+      harnesses: harnesses.map(({ name, label, loginHelp }) => ({ name, label, loginHelp })),
+      auth: getSetting<SetupView["auth"]>("auth"),
+      paused: getSetting<string>("paused"),
+      credentialSince: harness ? (getSetting<{ since: string }>(`credential:${harness}`)?.since ?? null) : null,
+    };
+  }
+
+  http.get("/api/setup", (c) => c.json(setupView()));
+
+  http.put("/api/setup", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const name = body?.harness;
+    if (!harnesses.some((h) => h.name === name)) return c.json({ error: `Unknown harness: ${name}` }, 400);
+    if (getSetting("harness") !== name) {
+      setSetting("harness", name);
+      deleteSetting("auth");
+    }
+    return c.json(setupView());
+  });
+
+  http.post("/api/setup/test-auth", async (c) => {
+    const harness = harnesses.find((h) => h.name === getSetting("harness"));
+    if (!harness) return c.json({ error: "Choose a harness first" }, 409);
+    const { state, log } = await harness.checkAuth();
+    setSetting("auth", { state, checkedAt: iso(clock.now()), log });
+    const pause = PAUSE_REASONS[state];
+    if (state === "ok") deleteSetting("paused");
+    else if (pause) setSetting("paused", pause);
+    return c.json(setupView());
   });
 
   http.get("*", (c) => {

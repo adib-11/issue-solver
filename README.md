@@ -45,12 +45,13 @@ Copy every directory under `skills/` into your harness's skills directory (for e
 
 ## auto-solve service (in progress)
 
-`service/` holds an unattended controller that works through open issues on your personal repositories. So far it scans and queues issues. No agent runs yet.
+`service/` holds an unattended controller that works through open issues on your personal repositories. So far it scans and queues issues, and can check that Claude Code is logged in. No agent runs yet.
 
 1. Create a GitHub App with Issues read, Contents write, Pull requests write, and Metadata read permissions. Download its private key.
 2. Install the App on your personal account (not an organisation) and select the repositories it may work on. The controller rejects installations on any other account.
 3. Copy `.env.example` to `.env` and fill it in. Put the private key at `./github-app.pem`, or set `GITHUB_APP_PRIVATE_KEY_PATH`.
 4. Run `docker compose up --build`. The controller scans at startup and every 60 seconds.
 5. Open `http://localhost:3000` and sign in as `admin` with `ADMIN_PASSWORD`.
+6. Open Setup, choose Claude Code, and follow the login steps shown there: run `claude setup-token`, put the token in `.env` as `CLAUDE_CODE_OAUTH_TOKEN`, restart, and click Test auth. The service only uses your Claude subscription, never an API key.
 
 Development: `cd service && bun install && bun test && bun run typecheck`.

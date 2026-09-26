@@ -1,0 +1,8 @@
+{
+  "exit": 0,
+  "stdout": [
+    {"type":"system","subtype":"init","cwd":"/work","session_id":"5b1c","tools":["Bash","Edit","Read","StructuredOutput"],"model":"claude-opus-5-5","permissionMode":"bypassPermissions","apiKeySource":"none"},
+    {"type":"assistant","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_01","name":"StructuredOutput","input":{"summary":"Adds a --dry-run flag","tests":["test/cli.test.ts"]}}],"stop_reason":"tool_use"},"parent_tool_use_id":null,"session_id":"5b1c"},
+    {"type":"result","subtype":"success","is_error":false,"duration_ms":8123,"num_turns":2,"result":"","session_id":"5b1c","total_cost_usd":0.04,"structured_output":{"summary":"Adds a --dry-run flag","tests":["test/cli.test.ts"]}}
+  ]
+}

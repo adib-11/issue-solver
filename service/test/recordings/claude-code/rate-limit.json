@@ -1,0 +1,8 @@
+{
+  "exit": 1,
+  "stdout": [
+    {"type":"system","subtype":"init","cwd":"/work","session_id":"5b1c","tools":["Bash","Edit","Read","StructuredOutput"],"model":"claude-opus-5-5","permissionMode":"bypassPermissions","apiKeySource":"none"},
+    {"type":"assistant","message":{"id":"msg_02","type":"message","role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"Claude usage limit reached. Your limit will reset at 5pm (UTC)."}]},"parent_tool_use_id":null,"session_id":"5b1c","error":"rate_limit"},
+    {"type":"result","subtype":"success","is_error":true,"duration_ms":412,"num_turns":1,"result":"Claude usage limit reached. Your limit will reset at 5pm (UTC).","session_id":"5b1c"}
+  ]
+}

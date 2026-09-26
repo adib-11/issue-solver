@@ -5,6 +5,7 @@ import { createApp } from "../src/app";
 import type { Clock } from "../src/clock";
 import type { Config } from "../src/config";
 import type { GitHub, Installation, Issue, Repo } from "../src/github";
+import type { AuthState, Harness, RunOptions, RunResult } from "../src/harness";
 
 export class FakeGitHub implements GitHub {
   installations: Installation[] = [];
@@ -37,6 +38,29 @@ export class FakeGitHub implements GitHub {
 
   sinceArgs() {
     return this.calls.filter((c) => c.op === "listIssues").map((c) => c.args[2]);
+  }
+}
+
+export class FakeHarness implements Harness {
+  label: string;
+  loginHelp: string;
+  authState: AuthState | "error" = "ok";
+  authChecks = 0;
+  constructor(
+    public name: string,
+    public credential?: string,
+  ) {
+    this.label = `Label of ${name}`;
+    this.loginHelp = `Log in to ${name} like this.`;
+  }
+
+  async checkAuth() {
+    this.authChecks++;
+    return { state: this.authState, log: `${this.name} auth: ${this.authState}` };
+  }
+
+  async run(_: RunOptions): Promise<RunResult> {
+    throw new Error("No phase runs a harness yet");
   }
 }
 
@@ -105,14 +129,16 @@ export function setup() {
     port: 0,
   };
   github.installations = [{ id: 10, account: { login: OWNER, type: "User" } }];
-  const app = createApp({ config, github, clock });
+  const harnesses = [new FakeHarness("claude-code", "token-1"), new FakeHarness("other")];
+  let app = createApp({ config, github, clock, harnesses });
 
   const auth = { Authorization: `Basic ${btoa(`admin:${PASSWORD}`)}` };
   async function get(path: string, headers: Record<string, string> = auth) {
     return app.fetch(new Request(`http://localhost${path}`, { headers }));
   }
-  async function post(path: string) {
-    return app.fetch(new Request(`http://localhost${path}`, { method: "POST", headers: { ...auth, Origin: "http://localhost" } }));
+  async function post(path: string, body?: unknown, method = "POST") {
+    const headers = { ...auth, Origin: "http://localhost", "Content-Type": "application/json" };
+    return app.fetch(new Request(`http://localhost${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) }));
   }
   async function json(path: string) {
     const res = await get(path);
@@ -121,7 +147,15 @@ export function setup() {
   }
 
   return {
-    app,
+    get app() {
+      return app;
+    },
+    /** A new app on the same database, as after a service restart. */
+    restart() {
+      app.stop();
+      app = createApp({ config, github, clock, harnesses });
+    },
+    harnesses,
     github,
     clock,
     config,

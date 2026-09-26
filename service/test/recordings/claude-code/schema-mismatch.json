@@ -1,0 +1,7 @@
+{
+  "exit": 0,
+  "stdout": [
+    {"type":"system","subtype":"init","cwd":"/work","session_id":"5b1c","tools":["Bash","Edit","Read","StructuredOutput"],"model":"claude-opus-5-5","permissionMode":"bypassPermissions","apiKeySource":"none"},
+    {"type":"result","subtype":"success","is_error":false,"duration_ms":5120,"num_turns":2,"result":"","session_id":"5b1c","structured_output":{"summary":"Adds a --dry-run flag","tests":"test/cli.test.ts"}}
+  ]
+}
