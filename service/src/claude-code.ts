@@ -39,20 +39,22 @@ export function claudeCode(options: { token?: string; command?: string[] }): Har
     } catch (err) {
       return { ok: false, error: "crash", log: `Could not start ${command.join(" ")}: ${(err as Error).message}` };
     }
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      proc.kill("SIGKILL");
-    }, timeoutMs);
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout as ReadableStream).text(),
-      new Response(proc.stderr as ReadableStream).text(),
-      proc.exited,
-    ]);
+    // Stop waiting at the deadline even if a leftover subprocess still holds the pipes open.
+    let timer: Timer | undefined;
+    const deadline = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), timeoutMs);
+    });
+    const stdoutText = new Response(proc.stdout as ReadableStream).text();
+    const stderrText = new Response(proc.stderr as ReadableStream).text();
+    const finished = await Promise.race([Promise.all([stdoutText, stderrText, proc.exited]), deadline]);
     clearTimeout(timer);
+    if (finished === "timeout") {
+      proc.kill("SIGKILL");
+      return { ok: false, error: "timeout", log: `Killed after ${timeoutMs} ms.` };
+    }
+    const [stdout, stderr, exitCode] = finished;
 
     const log = redact(stderr ? `${stdout}\n--- stderr ---\n${stderr}` : stdout);
-    if (timedOut) return { ok: false, error: "timeout", log: `${log}\nKilled after ${timeoutMs} ms.` };
     const events = stdout.split("\n").flatMap((line) => {
       try {
         return [JSON.parse(line)];
@@ -60,10 +62,13 @@ export function claudeCode(options: { token?: string; command?: string[] }): Har
         return [];
       }
     });
-    const typed = events.map((e) => TYPED_ERRORS[e?.error]).find(Boolean);
-    if (typed) return { ok: false, error: typed, log };
     const result = events.findLast((e) => e?.type === "result");
-    if (!result || result.is_error || exitCode !== 0) return { ok: false, error: "crash", log };
+    if (result?.subtype === "error_max_structured_output_retries") return { ok: false, error: "bad_output", log };
+    if (!result || result.is_error || exitCode !== 0) {
+      // A typed error only decides the outcome when the run failed; the CLI retries some on its own.
+      const typed = events.map((e) => e?.error).find((kind) => Object.hasOwn(TYPED_ERRORS, kind));
+      return { ok: false, error: typed ? TYPED_ERRORS[typed]! : "crash", log };
+    }
     const invalid = "structured_output" in result ? schemaError(schema, result.structured_output) : "no structured_output in the result";
     if (invalid) return { ok: false, error: "bad_output", log: `${log}\nOutput rejected: ${invalid}` };
     return { ok: true, output: result.structured_output, log };

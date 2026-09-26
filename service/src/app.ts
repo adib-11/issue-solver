@@ -5,7 +5,7 @@ import type { Clock } from "./clock";
 import type { Config } from "./config";
 import { openDb } from "./db";
 import type { GitHub, Issue, Repo } from "./github";
-import type { Harness } from "./harness";
+import type { AuthCheckState, Harness, SetupView } from "./harness";
 import { JOB_STATES, type Job, UNTRUSTED_AUTHOR } from "./jobs";
 
 const PAGE_SIZE = 50;
@@ -27,7 +27,7 @@ function candidateSkipReason(issue: Issue): (typeof FILTER_REASONS)[number] | nu
   return null;
 }
 
-const PAUSE_REASONS: Record<string, string> = {
+const PAUSE_REASONS: Partial<Record<AuthCheckState, string>> = {
   auth: "Harness auth failed: log in again as the setup page shows, then click Test auth.",
   quota: "Harness quota exhausted: wait for it to reset, then click Test auth.",
 };
@@ -60,6 +60,8 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   };
   const setSettingQuery = db.query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value");
   const setSetting = (key: string, value: unknown) => setSettingQuery.run(key, JSON.stringify(value));
+  const deleteSettingQuery = db.query("DELETE FROM settings WHERE key = ?");
+  const deleteSetting = (key: string) => deleteSettingQuery.run(key);
 
   // Tracks when each harness credential was first seen, by hash, so the setup page can show its age.
   for (const harness of harnesses) {
@@ -171,12 +173,12 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     return c.json({ error: `Run anyway only applies to jobs skipped as ${UNTRUSTED_AUTHOR}` }, 409);
   });
 
-  function setupView() {
+  function setupView(): SetupView {
     const harness = getSetting<string>("harness");
     return {
       harness,
       harnesses: harnesses.map(({ name, label, loginHelp }) => ({ name, label, loginHelp })),
-      auth: getSetting<{ state: string; checkedAt: string; log: string }>("auth"),
+      auth: getSetting<SetupView["auth"]>("auth"),
       paused: getSetting<string>("paused"),
       credentialSince: harness ? (getSetting<{ since: string }>(`credential:${harness}`)?.since ?? null) : null,
     };
@@ -190,7 +192,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     if (!harnesses.some((h) => h.name === name)) return c.json({ error: `Unknown harness: ${name}` }, 400);
     if (getSetting("harness") !== name) {
       setSetting("harness", name);
-      db.query("DELETE FROM settings WHERE key = 'auth'").run();
+      deleteSetting("auth");
     }
     return c.json(setupView());
   });
@@ -200,8 +202,9 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     if (!harness) return c.json({ error: "Choose a harness first" }, 409);
     const { state, log } = await harness.checkAuth();
     setSetting("auth", { state, checkedAt: iso(clock.now()), log });
-    if (state === "ok") db.query("DELETE FROM settings WHERE key = 'paused'").run();
-    else if (PAUSE_REASONS[state]) setSetting("paused", PAUSE_REASONS[state]);
+    const pause = PAUSE_REASONS[state];
+    if (state === "ok") deleteSetting("paused");
+    else if (pause) setSetting("paused", pause);
     return c.json(setupView());
   });
 

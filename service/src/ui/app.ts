@@ -1,14 +1,8 @@
 // Dashboard. Everything from the API is rendered with textContent only; see scripts/no-html-insertion.sh.
+import type { AuthCheckState, SetupView as Setup } from "../harness";
 import { JOB_STATES, type Job, UNTRUSTED_AUTHOR } from "../jobs";
 
 type JobPage = { jobs: Job[]; page: number; pageSize: number; total: number };
-type Setup = {
-  harness: string | null;
-  harnesses: { name: string; label: string; loginHelp: string }[];
-  auth: { state: string; checkedAt: string; log: string } | null;
-  paused: string | null;
-  credentialSince: string | null;
-};
 
 const POLL_MS = 2000;
 const focusRing = "rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600";
@@ -171,11 +165,11 @@ async function act(control: HTMLButtonElement | HTMLInputElement, status: HTMLEl
   await refresh(); // re-renders only when the response changed the setup
 }
 
-const AUTH_LABELS: Record<string, string> = { ok: "auth ok", auth: "login needed", quota: "quota exhausted", error: "auth check failed" };
+const AUTH_LABELS: Record<AuthCheckState, string> = { ok: "auth ok", auth: "login needed", quota: "quota exhausted", error: "auth check failed" };
 
 function renderHeader(setup: Setup) {
   const harness = setup.harnesses.find((h) => h.name === setup.harness);
-  const auth = !harness ? "not set up" : setup.auth ? (AUTH_LABELS[setup.auth.state] ?? setup.auth.state) : "auth not tested";
+  const auth = !harness ? "not set up" : setup.auth ? AUTH_LABELS[setup.auth.state] : "auth not tested";
   const warn = !harness || setup.auth?.state !== "ok" || setup.paused;
   header.replaceChildren(
     el("span", {}, "Harness: ", el("strong", { textContent: harness ? `${harness.label}, ${auth}` : auth })),
@@ -204,7 +198,7 @@ function renderSetup(content: HTMLElement, setup: Setup) {
     parts.push(section(`Log in to ${harness.label}`, pre(harness.loginHelp)));
     if (setup.credentialSince) {
       const days = Math.floor((Date.now() - Date.parse(setup.credentialSince)) / DAY_MS);
-      parts.push(section("Token age", el("p", {}, `In use since `, time(setup.credentialSince), ` (${days} days). Tokens from claude setup-token last one year.`)));
+      parts.push(section("Token age", el("p", {}, `In use since `, time(setup.credentialSince), ` (${days} days).`)));
     }
     const test = button("test-auth", "Test auth");
     test.addEventListener("click", () => act(test, status, "/api/setup/test-auth", { method: "POST" }, "Test auth"));
@@ -212,7 +206,7 @@ function renderSetup(content: HTMLElement, setup: Setup) {
       section(
         "Test auth",
         el("div", { class: "flex flex-wrap items-center gap-2" }, test, status),
-        ...(setup.auth ? [el("p", { class: "mt-2" }, `Last result: ${AUTH_LABELS[setup.auth.state] ?? setup.auth.state}, `, time(setup.auth.checkedAt)), pre(setup.auth.log)] : []),
+        ...(setup.auth ? [el("p", { class: "mt-2" }, `Last result: ${AUTH_LABELS[setup.auth.state]}, `, time(setup.auth.checkedAt)), pre(setup.auth.log)] : []),
       ),
     );
   } else parts.push(status);
@@ -234,9 +228,9 @@ async function refreshHeader() {
 }
 
 async function refresh(showLoading = false) {
-  refreshHeader();
   const request = ++latest;
   const { jobId, setup } = route();
+  if (!setup) refreshHeader(); // the setup page's own response renders the header
   if (showLoading) {
     lastBody = "";
     content.replaceChildren(notice("Loading…"));
@@ -249,6 +243,10 @@ async function refresh(showLoading = false) {
     const body = await res.text();
     if (request !== latest) return; // a newer request (route, filter, or page change) owns the view
     if (!res.ok) throw new Error(res.status === 404 ? "Job not found." : `Request failed (${res.status}).`);
+    if (setup && body !== lastHeader) {
+      lastHeader = body;
+      renderHeader(JSON.parse(body));
+    }
     if (body === lastBody) return; // unchanged: keep the DOM, and keyboard focus with it
     lastBody = body;
     const focusedId = document.activeElement?.id;

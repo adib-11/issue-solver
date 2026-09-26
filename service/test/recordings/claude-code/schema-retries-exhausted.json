@@ -1,0 +1,7 @@
+{
+  "exit": 1,
+  "stdout": [
+    {"type":"system","subtype":"init","cwd":"/work","session_id":"5b1c","tools":["Bash","Edit","Read","StructuredOutput"],"model":"claude-opus-5-5","permissionMode":"bypassPermissions","apiKeySource":"none"},
+    {"type":"result","subtype":"error_max_structured_output_retries","is_error":true,"duration_ms":30120,"num_turns":6,"session_id":"5b1c"}
+  ]
+}

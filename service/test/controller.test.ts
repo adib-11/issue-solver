@@ -334,13 +334,18 @@ describe("harness setup", () => {
     });
   });
 
-  test("the chosen harness is stored and survives a restart; unknown harnesses are refused", async () => {
+  test("the chosen harness is stored and survives a restart", async () => {
     t = setup();
     expect((await t.post("/api/setup", { harness: "claude-code" }, "PUT")).status).toBe(200);
-    expect((await t.post("/api/setup", { harness: "nope" }, "PUT")).status).toBe(400);
-    expect((await t.post("/api/setup", {}, "PUT")).status).toBe(400);
     t.restart();
     expect((await t.json("/api/setup")).harness).toBe("claude-code");
+  });
+
+  test("an unknown or missing harness is refused", async () => {
+    t = setup();
+    expect((await t.post("/api/setup", { harness: "nope" }, "PUT")).status).toBe(400);
+    expect((await t.post("/api/setup", {}, "PUT")).status).toBe(400);
+    expect((await t.json("/api/setup")).harness).toBeNull();
   });
 
   test("Test auth needs a chosen harness", async () => {

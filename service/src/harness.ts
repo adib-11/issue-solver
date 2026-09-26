@@ -1,6 +1,8 @@
 // The contract every harness adapter (Claude Code, Codex) implements.
 
 export type AuthState = "ok" | "auth" | "quota";
+/** An auth check's outcome: "error" when the check failed for another reason (see its log). */
+export type AuthCheckState = AuthState | "error";
 export type RunError = "auth" | "quota" | "timeout" | "bad_output" | "crash";
 
 export type RunResult = { ok: true; output: unknown; log: string } | { ok: false; error: RunError; log: string };
@@ -14,11 +16,21 @@ export interface Harness {
   loginHelp: string;
   /** The long-lived secret the harness logs in with, when it has one; the setup page shows its age. */
   credential?: string;
-  /** "error" when the check itself failed for a reason other than auth or quota (see the log). */
-  checkAuth(): Promise<{ state: AuthState | "error"; log: string }>;
+  checkAuth(): Promise<{ state: AuthCheckState; log: string }>;
   /** A fresh, non-interactive session. The output is re-validated against the schema, whatever the CLI claims. */
   run(options: RunOptions): Promise<RunResult>;
 }
+
+/** GET /api/setup: shared by the controller and the dashboard. */
+export type SetupView = {
+  harness: string | null;
+  harnesses: { name: string; label: string; loginHelp: string }[];
+  auth: { state: AuthCheckState; checkedAt: string; log: string } | null;
+  /** Why dispatch is paused, or null. */
+  paused: string | null;
+  /** When the chosen harness's credential was first seen. */
+  credentialSince: string | null;
+};
 
 /** The subset of JSON Schema that phase schemas use. */
 export type JsonSchema = {

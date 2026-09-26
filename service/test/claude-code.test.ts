@@ -64,7 +64,22 @@ test("returns the structured output field and the log", async () => {
 
 test("output that does not match the schema is bad_output, even when the CLI accepted it", async () => {
   expect(await replaying("schema-mismatch").run()).toMatchObject({ ok: false, error: "bad_output" });
+});
+
+test("a result with no structured output is bad_output", async () => {
   expect(await replaying("no-structured-output").run()).toMatchObject({ ok: false, error: "bad_output" });
+});
+
+test("the CLI giving up on its own schema retries is bad_output", async () => {
+  expect(await replaying("schema-retries-exhausted").run()).toMatchObject({ ok: false, error: "bad_output" });
+});
+
+test("a typed error the CLI recovered from does not fail a successful run", async () => {
+  expect(await replaying("retried-rate-limit").run()).toMatchObject({ ok: true });
+});
+
+test("an unknown error category is a crash", async () => {
+  expect(await replaying("unknown-error").run()).toMatchObject({ ok: false, error: "crash" });
 });
 
 test("classifies typed stream-json errors", async () => {
@@ -78,6 +93,12 @@ test("classifies typed stream-json errors", async () => {
 test("a run over its time limit is killed and reported as timeout", async () => {
   const started = Date.now();
   expect(await replaying("hang").run(300)).toMatchObject({ ok: false, error: "timeout" });
+  expect(Date.now() - started).toBeLessThan(5000);
+});
+
+test("the timeout fires even when a leftover subprocess keeps the output open", async () => {
+  const started = Date.now();
+  expect(await replaying("orphan").run(300)).toMatchObject({ ok: false, error: "timeout" });
   expect(Date.now() - started).toBeLessThan(5000);
 });
 
@@ -104,7 +125,6 @@ test("the auth check maps a run to ok, auth, or quota, and anything else to erro
 
 test("has login help naming claude setup-token and the token variable", () => {
   const { harness } = replaying("success");
-  expect(harness.name).toBe("claude-code");
   expect(harness.loginHelp).toContain("claude setup-token");
   expect(harness.loginHelp).toContain("CLAUDE_CODE_OAUTH_TOKEN");
 });
