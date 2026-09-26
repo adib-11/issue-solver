@@ -32,7 +32,7 @@ export class FakeGitHub implements GitHub {
       throw new Error("GitHub 502");
     }
     const all = this.issues.get(repo.id) ?? [];
-    return since === undefined ? all : all.filter((i) => i.updated_at >= since);
+    return since === undefined ? all : all.filter((i) => i.updatedAt >= since);
   }
 
   sinceArgs() {
@@ -76,18 +76,20 @@ export function issue(number: number, over: Partial<Issue> = {}): Issue {
   return {
     number,
     title: `Issue ${number}`,
-    html_url: `https://github.com/octo/app/issues/${number}`,
-    state: "open",
-    user: { login: OWNER },
-    author_association: "OWNER",
-    created_at: "2025-12-01T00:00:00Z",
-    updated_at: "2025-12-01T00:00:00Z",
+    url: `https://github.com/octo/app/issues/${number}`,
+    state: "OPEN",
+    authorAssociation: "OWNER",
+    createdAt: "2025-12-01T00:00:00Z",
+    updatedAt: "2025-12-01T00:00:00Z",
+    assignees: { totalCount: 0 },
+    closedByPullRequestsReferences: { nodes: [] },
+    timelineItems: { nodes: [] },
     ...over,
   };
 }
 
-export function repo(id: number, name = "app"): Repo {
-  return { id, full_name: `${OWNER}/${name}`, fork: false, archived: false };
+export function repo(id: number, name = "app", over: Partial<Repo> = {}): Repo {
+  return { id, full_name: `${OWNER}/${name}`, fork: false, archived: false, ...over };
 }
 
 export function setup() {
@@ -109,6 +111,9 @@ export function setup() {
   async function get(path: string, headers: Record<string, string> = auth) {
     return app.fetch(new Request(`http://localhost${path}`, { headers }));
   }
+  async function post(path: string) {
+    return app.fetch(new Request(`http://localhost${path}`, { method: "POST", headers: { ...auth, Origin: "http://localhost" } }));
+  }
   async function json(path: string) {
     const res = await get(path);
     if (res.status !== 200) throw new Error(`${path} -> ${res.status}`);
@@ -122,6 +127,7 @@ export function setup() {
     config,
     auth,
     get,
+    post,
     json,
     cleanup() {
       app.stop();

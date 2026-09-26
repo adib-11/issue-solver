@@ -2,23 +2,44 @@ import { createSign } from "node:crypto";
 
 export type Installation = { id: number; account: { login: string; type: string } };
 export type Repo = { id: number; full_name: string; fork: boolean; archived: boolean };
+/** An issue as the GraphQL query below returns it. Pull requests are never included. */
 export type Issue = {
   number: number;
   title: string;
-  html_url: string;
-  state: "open" | "closed";
-  user: { login: string } | null;
-  author_association: string;
-  created_at: string;
-  updated_at: string;
-  pull_request?: unknown;
+  url: string;
+  state: "OPEN" | "CLOSED";
+  authorAssociation: string;
+  createdAt: string;
+  updatedAt: string;
+  assignees: { totalCount: number };
+  closedByPullRequestsReferences: { nodes: { state: string }[] };
+  /** Cross-referenced events; `source.state` is set only when the source is a pull request. */
+  timelineItems: { nodes: { isCrossRepository?: boolean; source?: { state?: string } }[] };
 };
+
+// Same fields as the skill bundle's candidate filter (skills/solve-issue/scripts/candidates.sh).
+const ISSUES_QUERY = `
+query($owner: String!, $name: String!, $since: DateTime, $after: String) {
+  repository(owner: $owner, name: $name) {
+    issues(first: 100, after: $after, filterBy: {since: $since}, orderBy: {field: UPDATED_AT, direction: ASC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number title url state authorAssociation createdAt updatedAt
+        assignees { totalCount }
+        closedByPullRequestsReferences(first: 10) { nodes { state } }
+        timelineItems(itemTypes: [CROSS_REFERENCED_EVENT], last: 20) {
+          nodes { ... on CrossReferencedEvent { isCrossRepository source { ... on PullRequest { state } } } }
+        }
+      }
+    }
+  }
+}`;
 
 /** The only GitHub operations the controller uses. Tests replace this with a fake. */
 export interface GitHub {
   listInstallations(): Promise<Installation[]>;
   listInstallationRepos(installationId: number): Promise<Repo[]>;
-  /** Issues and PRs updated at or after `since` (ISO time), all states. */
+  /** Issues (not PRs) updated at or after `since` (ISO time), all states. */
   listIssues(installationId: number, repo: Repo, since: string | undefined): Promise<Issue[]>;
 }
 
@@ -79,9 +100,23 @@ export function createGitHubClient(appId: string, privateKey: string): GitHub {
 
     async listIssues(installationId, repo, since) {
       const token = await installationToken(installationId);
-      const query = new URLSearchParams({ state: "all", sort: "updated", direction: "asc", per_page: "100" });
-      if (since) query.set("since", since);
-      return paginate<Issue>(`/repos/${repo.full_name}/issues?${query}`, token);
+      const [owner, name] = repo.full_name.split("/");
+      const issues: Issue[] = [];
+      let after: string | null = null;
+      do {
+        const res = await request("/graphql", token, {
+          method: "POST",
+          body: JSON.stringify({ query: ISSUES_QUERY, variables: { owner, name, since: since ?? null, after } }),
+        });
+        const body = (await res.json()) as any;
+        if (body.errors || !body.data?.repository) {
+          throw new Error(`GitHub GraphQL issues of ${repo.full_name}: ${JSON.stringify(body.errors ?? "repository not found")}`);
+        }
+        const page = body.data.repository.issues;
+        issues.push(...page.nodes);
+        after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+      } while (after);
+      return issues;
     },
   };
 }

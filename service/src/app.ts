@@ -4,14 +4,27 @@ import { basicAuth } from "hono/basic-auth";
 import type { Clock } from "./clock";
 import type { Config } from "./config";
 import { openDb } from "./db";
-import type { GitHub, Repo } from "./github";
-import { JOB_STATES } from "./jobs";
+import type { GitHub, Issue, Repo } from "./github";
+import { JOB_STATES, type Job, UNTRUSTED_AUTHOR } from "./jobs";
 
 const PAGE_SIZE = 50;
 const SCAN_INTERVAL_MS = 60_000;
 const CURSOR_OVERLAP_MS = 60_000;
 const DIST = join(import.meta.dir, "../dist");
+const TRUSTED_AUTHORS = ["OWNER", "COLLABORATOR"];
 const STATIC_FILES: Record<string, string> = { "/": "index.html", "/app.js": "app.js", "/app.css": "app.css" };
+
+type ScannedRepo = { repo: Repo; issues: Issue[] };
+const FILTER_REASONS = ["closed", "assigned", "open closing PR", "referenced by open PR"] as const;
+
+/** The skill bundle's candidate filter (skills/solve-issue/scripts/candidates.jq): work already in flight. */
+function candidateSkipReason(issue: Issue): (typeof FILTER_REASONS)[number] | null {
+  const open = (pr?: { state?: string }) => pr?.state === "OPEN";
+  if (issue.assignees.totalCount > 0) return "assigned";
+  if (issue.closedByPullRequestsReferences.nodes.some(open)) return "open closing PR";
+  if (issue.timelineItems.nodes.some((e) => !e.isCrossRepository && open(e.source))) return "referenced by open PR";
+  return null;
+}
 
 export function createApp(deps: { config: Config; github: GitHub; clock: Clock }) {
   const { config, github, clock } = deps;
@@ -23,22 +36,41 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock }
     "INSERT INTO scan_cursors (repo_id, scanned_at) VALUES (?, ?) ON CONFLICT (repo_id) DO UPDATE SET scanned_at = excluded.scanned_at",
   );
   const insertJob = db.query(`INSERT INTO jobs
-    (repo_id, repo_full_name, issue_number, issue_title, issue_url, state, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+    (repo_id, repo_full_name, issue_number, issue_title, issue_url, state, skip_reason, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (repo_id, issue_number) DO NOTHING`);
+  // Filter skips follow the issue on every scan; untrusted-author skips wait for Run anyway.
+  const filterSkipped = `state = 'skipped' AND skip_reason IN (${FILTER_REASONS.map((r) => `'${r}'`).join(", ")})`;
+  const skipJob = db.query(`UPDATE jobs SET state = 'skipped', skip_reason = ?1, updated_at = ?2
+    WHERE repo_id = ?3 AND issue_number = ?4 AND (state = 'queued' OR (${filterSkipped} AND skip_reason <> ?1))`);
+  const liftSkip = db.query(`UPDATE jobs SET state = ?1, skip_reason = ?2, updated_at = ?3
+    WHERE repo_id = ?4 AND issue_number = ?5 AND ${filterSkipped}`);
+  const getJob = db.query<Job, [number]>("SELECT * FROM jobs WHERE id = ?");
 
-  async function scanRepo(installationId: number, repo: Repo, scanStart: number) {
+  /** Records one scan's results: every successfully listed repo, committed together so jobs are numbered oldest issue first. */
+  function record(scanned: ScannedRepo[], scanStart: number) {
+    const now = iso(clock.now());
+    const found = scanned
+      .flatMap(({ repo, issues }) => issues.map((issue) => ({ repo, issue })))
+      .sort((a, b) => Date.parse(a.issue.createdAt) - Date.parse(b.issue.createdAt));
+    db.transaction(() => {
+      for (const { repo, issue } of found) {
+        const reason = issue.state === "CLOSED" ? "closed" : candidateSkipReason(issue);
+        const skip = reason ?? (TRUSTED_AUTHORS.includes(issue.authorAssociation) ? null : UNTRUSTED_AUTHOR);
+        const state = skip ? "skipped" : "queued";
+        if (reason) skipJob.run(reason, now, repo.id, issue.number);
+        else liftSkip.run(state, skip, now, repo.id, issue.number);
+        if (issue.state === "CLOSED") continue;
+        insertJob.run(repo.id, repo.full_name, issue.number, issue.title, issue.url, state, skip, now, now);
+      }
+      for (const { repo } of scanned) setCursor.run(repo.id, iso(scanStart));
+    })();
+  }
+
+  async function scanRepo(installationId: number, repo: Repo): Promise<ScannedRepo> {
     const cursor = getCursor.get(repo.id)?.scanned_at;
     const since = cursor ? iso(Date.parse(cursor) - CURSOR_OVERLAP_MS) : undefined;
-    const issues = await github.listIssues(installationId, repo, since);
-    const now = iso(clock.now());
-    db.transaction(() => {
-      for (const issue of issues) {
-        if (issue.pull_request || issue.state !== "open") continue;
-        insertJob.run(repo.id, repo.full_name, issue.number, issue.title, issue.html_url, now, now);
-      }
-      setCursor.run(repo.id, iso(scanStart));
-    })();
+    return { repo, issues: await github.listIssues(installationId, repo, since) };
   }
 
   let scanning = false;
@@ -46,6 +78,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock }
     if (scanning) return;
     scanning = true;
     const scanStart = clock.now();
+    const scanned: ScannedRepo[] = [];
     try {
       for (const installation of await github.listInstallations()) {
         const { login, type } = installation.account;
@@ -61,11 +94,15 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock }
           continue;
         }
         for (const repo of repos) {
-          await scanRepo(installation.id, repo, scanStart).catch((err) =>
-            console.error(`Scan of ${repo.full_name} failed; cursor not advanced:`, err),
-          );
+          if (repo.fork || repo.archived) continue;
+          try {
+            scanned.push(await scanRepo(installation.id, repo));
+          } catch (err) {
+            console.error(`Scan of ${repo.full_name} failed; cursor not advanced:`, err);
+          }
         }
       }
+      record(scanned, scanStart);
     } catch (err) {
       console.error("Scan failed:", err);
     } finally {
@@ -98,8 +135,17 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock }
   });
 
   http.get("/api/jobs/:id", (c) => {
-    const job = db.query("SELECT * FROM jobs WHERE id = ?").get(Number(c.req.param("id")));
+    const job = getJob.get(Number(c.req.param("id")));
     return job ? c.json(job) : c.json({ error: "Job not found" }, 404);
+  });
+
+  const runAnyway = db.query(`UPDATE jobs SET state = 'queued', skip_reason = NULL, updated_at = ?
+    WHERE id = ? AND state = 'skipped' AND skip_reason = ?`);
+  http.post("/api/jobs/:id/run-anyway", (c) => {
+    const id = Number(c.req.param("id"));
+    if (runAnyway.run(iso(clock.now()), id, UNTRUSTED_AUTHOR).changes) return c.json(getJob.get(id), 202);
+    if (!getJob.get(id)) return c.json({ error: "Job not found" }, 404);
+    return c.json({ error: `Run anyway only applies to jobs skipped as ${UNTRUSTED_AUTHOR}` }, 409);
   });
 
   http.get("*", (c) => {

@@ -31,14 +31,10 @@ describe("installation ownership", () => {
 });
 
 describe("scan", () => {
-  test("queues open issues and ignores pull requests and closed issues", async () => {
+  test("queues open issues and creates no job for an issue already closed", async () => {
     t = setup();
     t.github.repos.set(10, [repo(1)]);
-    t.github.issues.set(1, [
-      issue(1),
-      issue(2, { pull_request: { url: "x" } }),
-      issue(3, { state: "closed" }),
-    ]);
+    t.github.issues.set(1, [issue(1), issue(3, { state: "CLOSED" })]);
     await t.app.scan();
     const { jobs } = await t.json("/api/jobs");
     expect(jobs.map((j: any) => [j.issue_number, j.state])).toEqual([[1, "queued"]]);
@@ -47,8 +43,8 @@ describe("scan", () => {
   test("each issue produces exactly one job however many scans see it", async () => {
     t = setup();
     t.github.repos.set(10, [repo(1), repo(2, "lib")]);
-    t.github.issues.set(1, [issue(7, { updated_at: "2026-01-01T00:00:30Z" })]);
-    t.github.issues.set(2, [issue(7, { updated_at: "2026-01-01T00:00:30Z" })]);
+    t.github.issues.set(1, [issue(7, { updatedAt: "2026-01-01T00:00:30Z" })]);
+    t.github.issues.set(2, [issue(7, { updatedAt: "2026-01-01T00:00:30Z" })]);
     await t.app.scan();
     await t.clock.advance(60_000);
     await t.app.scan();
@@ -101,7 +97,7 @@ describe("scan", () => {
     t.github.issues.set(1, [issue(1)]);
     await t.app.start();
     expect((await t.json("/api/jobs")).total).toBe(1);
-    t.github.issues.get(1)!.push(issue(2, { updated_at: "2026-01-01T00:00:30Z" }));
+    t.github.issues.get(1)!.push(issue(2, { updatedAt: "2026-01-01T00:00:30Z" }));
     await t.clock.advance(59_000);
     expect((await t.json("/api/jobs")).total).toBe(1);
     await t.clock.advance(1_000);
@@ -183,5 +179,142 @@ describe("API", () => {
     const res = await t.get("/api/jobs");
     expect(res.headers.get("content-type")).toStartWith("application/json");
     expect((await res.json()).jobs[0].issue_title).toBe(title);
+  });
+});
+
+const jobStates = async () =>
+  Object.fromEntries(
+    (await t.json("/api/jobs")).jobs.map((j: any) => [j.issue_number, j.skip_reason ? `${j.state}: ${j.skip_reason}` : j.state]),
+  );
+
+describe("intake filters", () => {
+  test("skips forks and archived repos without listing their issues", async () => {
+    t = setup();
+    t.github.repos.set(10, [repo(1), repo(2, "fork", { fork: true }), repo(3, "old", { archived: true })]);
+    for (const id of [1, 2, 3]) t.github.issues.set(id, [issue(id)]);
+    await t.app.scan();
+    expect(t.github.calls.filter((c) => c.op === "listIssues").map((c) => c.args[1])).toEqual(["octo/app"]);
+    expect(await jobStates()).toEqual({ 1: "queued" });
+  });
+
+  test("only OWNER and COLLABORATOR issues are queued; others are skipped as untrusted author", async () => {
+    t = setup();
+    t.github.repos.set(10, [repo(1)]);
+    const associations = ["OWNER", "COLLABORATOR", "MEMBER", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE"];
+    t.github.issues.set(1, associations.map((authorAssociation, i) => issue(i + 1, { authorAssociation })));
+    await t.app.scan();
+    expect(await jobStates()).toEqual({
+      1: "queued",
+      2: "queued",
+      3: "skipped: untrusted author",
+      4: "skipped: untrusted author",
+      5: "skipped: untrusted author",
+      6: "skipped: untrusted author",
+    });
+  });
+
+  test("applies the skill bundle's candidate filter to its recorded GraphQL response", async () => {
+    t = setup();
+    const fixture = await Bun.file(new URL("../../scripts/fixtures/issues.json", import.meta.url)).json();
+    t.github.repos.set(10, [repo(1)]);
+    t.github.issues.set(1, fixture.data.repository.issues.nodes.map((node: any) => issue(node.number, node)));
+    await t.app.scan();
+    expect(await jobStates()).toEqual({
+      1: "queued",
+      2: "skipped: assigned",
+      3: "skipped: open closing PR",
+      4: "queued",
+      5: "skipped: referenced by open PR",
+    });
+  });
+
+  test("the candidate filter wins over the untrusted-author skip, so Run anyway cannot bypass it", async () => {
+    t = setup();
+    t.github.repos.set(10, [repo(1)]);
+    t.github.issues.set(1, [issue(1, { authorAssociation: "NONE", assignees: { totalCount: 1 } })]);
+    await t.app.scan();
+    expect(await jobStates()).toEqual({ 1: "skipped: assigned" });
+  });
+
+  test("a queued job is skipped when a later scan sees its issue closed or taken", async () => {
+    t = setup();
+    t.github.repos.set(10, [repo(1)]);
+    t.github.issues.set(1, [issue(1), issue(2), issue(3)]);
+    await t.app.scan();
+    await t.clock.advance(60_000);
+    t.github.issues.set(1, [
+      issue(1, { state: "CLOSED", updatedAt: "2026-01-01T00:00:30Z" }),
+      issue(2, { assignees: { totalCount: 1 }, updatedAt: "2026-01-01T00:00:30Z" }),
+      issue(3),
+    ]);
+    await t.app.scan();
+    expect(await jobStates()).toEqual({ 1: "skipped: closed", 2: "skipped: assigned", 3: "queued" });
+    const [job] = (await t.json("/api/jobs")).jobs.filter((j: any) => j.issue_number === 1);
+    expect((await t.json(`/api/jobs/${job.id}`)).skip_reason).toBe("closed");
+  });
+
+  test("a filtered skip lifts when a later scan sees the issue reopened or free, keeping the trust check", async () => {
+    t = setup();
+    t.github.repos.set(10, [repo(1)]);
+    const taken = { assignees: { totalCount: 1 } };
+    t.github.issues.set(1, [issue(1), issue(2, taken), issue(3, { ...taken, authorAssociation: "NONE" })]);
+    await t.app.scan();
+    t.github.issues.set(1, [issue(1, { state: "CLOSED", updatedAt: "2026-01-01T00:00:30Z" }), issue(2, taken), issue(3, taken)]);
+    await t.clock.advance(60_000);
+    await t.app.scan();
+    expect(await jobStates()).toEqual({ 1: "skipped: closed", 2: "skipped: assigned", 3: "skipped: assigned" });
+    const later = "2026-01-01T00:01:30Z";
+    t.github.issues.set(1, [
+      issue(1, { updatedAt: later }),
+      issue(2, { updatedAt: later }),
+      issue(3, { authorAssociation: "NONE", updatedAt: later }),
+    ]);
+    await t.clock.advance(60_000);
+    await t.app.scan();
+    expect(await jobStates()).toEqual({ 1: "queued", 2: "queued", 3: "skipped: untrusted author" });
+  });
+
+  test("open issues from every repo are queued oldest first", async () => {
+    t = setup();
+    t.github.repos.set(10, [repo(1), repo(2, "lib")]);
+    t.github.issues.set(1, [
+      issue(1, { createdAt: "2024-03-01T00:00:00Z" }),
+      issue(2, { createdAt: "2023-01-01T00:00:00Z" }),
+    ]);
+    t.github.issues.set(2, [issue(9, { createdAt: "2023-06-01T00:00:00Z", updatedAt: "2020-01-01T00:00:00Z" })]);
+    await t.app.scan();
+    const { jobs } = await t.json("/api/jobs");
+    const byId = [...jobs].sort((a: any, b: any) => a.id - b.id);
+    expect(byId.map((j: any) => `${j.repo_full_name}#${j.issue_number}`)).toEqual(["octo/app#2", "octo/lib#9", "octo/app#1"]);
+  });
+});
+
+describe("run anyway", () => {
+  test("re-queues an untrusted-author job, and later scans leave it queued", async () => {
+    t = setup();
+    t.github.repos.set(10, [repo(1)]);
+    t.github.issues.set(1, [issue(1, { authorAssociation: "NONE" })]);
+    await t.app.scan();
+    const [{ id }] = (await t.json("/api/jobs")).jobs;
+    await t.clock.advance(1_000);
+    const res = await t.post(`/api/jobs/${id}/run-anyway`);
+    expect(res.status).toBe(202);
+    expect(await res.json()).toMatchObject({ id, state: "queued", skip_reason: null, updated_at: "2026-01-01T00:00:01.000Z" });
+    t.github.issues.set(1, [issue(1, { authorAssociation: "NONE", updatedAt: "2026-01-01T00:00:30Z" })]);
+    await t.clock.advance(60_000);
+    await t.app.scan();
+    expect(await jobStates()).toEqual({ 1: "queued" });
+  });
+
+  test("is refused with 409 on any job not skipped for an untrusted author", async () => {
+    t = setup();
+    t.github.repos.set(10, [repo(1)]);
+    t.github.issues.set(1, [issue(1), issue(2, { assignees: { totalCount: 1 } })]);
+    await t.app.scan();
+    for (const job of (await t.json("/api/jobs")).jobs) {
+      expect((await t.post(`/api/jobs/${job.id}/run-anyway`)).status).toBe(409);
+    }
+    expect(await jobStates()).toEqual({ 1: "queued", 2: "skipped: assigned" });
+    expect((await t.post("/api/jobs/999/run-anyway")).status).toBe(404);
   });
 });
