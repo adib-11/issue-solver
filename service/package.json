@@ -1,0 +1,20 @@
+{
+  "name": "auto-solve",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/main.ts",
+    "build": "bun build src/ui/app.ts --outdir dist --minify && tailwindcss -i src/ui/app.css -o dist/app.css --minify && cp src/ui/index.html dist/index.html",
+    "typecheck": "tsc --noEmit && bash scripts/no-html-insertion.sh",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "hono": "4.13.9"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "4.3.3",
+    "@types/bun": "1.4.2",
+    "tailwindcss": "4.3.3",
+    "typescript": "7.0.2"
+  }
+}

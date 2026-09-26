@@ -1,0 +1,39 @@
+import { afterAll, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadConfig } from "../src/config";
+
+const dir = mkdtempSync(join(tmpdir(), "auto-solve-config-"));
+const keyFile = join(dir, "app.pem");
+writeFileSync(keyFile, "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----\n");
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+const full = {
+  OWNER_LOGIN: "octo",
+  GITHUB_APP_ID: "123",
+  GITHUB_APP_PRIVATE_KEY_FILE: keyFile,
+  ADMIN_PASSWORD: "pw",
+};
+
+test("loads required config", () => {
+  expect(loadConfig(full)).toMatchObject({
+    ownerLogin: "octo",
+    appId: "123",
+    privateKey: expect.stringContaining("BEGIN RSA PRIVATE KEY"),
+    adminPassword: "pw",
+  });
+});
+
+for (const name of Object.keys(full)) {
+  test(`aborts with a clear message when ${name} is missing`, () => {
+    expect(() => loadConfig({ ...full, [name]: "" })).toThrow(`Missing required config: ${name}`);
+  });
+}
+
+test("aborts with a clear message when the private key file cannot be read", () => {
+  const missing = join(dir, "nope.pem");
+  expect(() => loadConfig({ ...full, GITHUB_APP_PRIVATE_KEY_FILE: missing })).toThrow(
+    `Cannot read GITHUB_APP_PRIVATE_KEY_FILE at ${missing}`,
+  );
+});
