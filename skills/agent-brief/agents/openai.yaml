@@ -1,0 +1,3 @@
+interface:
+  display_name: "Agent Brief"
+  short_description: "Write an agent-ready issue brief"

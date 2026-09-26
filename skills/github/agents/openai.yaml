@@ -1,0 +1,3 @@
+interface:
+  display_name: "GitHub"
+  short_description: "gh conventions for issues and PRs"

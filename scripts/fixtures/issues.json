@@ -1,0 +1,20 @@
+{"data":{"repository":{"issues":{"nodes":[
+{"number":1,"title":"Free","url":"u1","body":"Crash when X","updatedAt":"2026-09-01T00:00:00Z",
+ "labels":{"nodes":[{"name":"good first issue"}]},"assignees":{"totalCount":0},
+ "comments":{"totalCount":2,"nodes":[{"authorAssociation":"MEMBER","createdAt":"2026-08-01T00:00:00Z"},{"authorAssociation":"NONE","createdAt":"2026-08-02T00:00:00Z"}]},
+ "closedByPullRequestsReferences":{"nodes":[]},"timelineItems":{"nodes":[]}},
+{"number":2,"title":"Assigned","url":"u2","body":"","updatedAt":"2026-09-01T00:00:00Z",
+ "labels":{"nodes":[]},"assignees":{"totalCount":1},"comments":{"totalCount":0,"nodes":[]},
+ "closedByPullRequestsReferences":{"nodes":[]},"timelineItems":{"nodes":[]}},
+{"number":3,"title":"Has open closing PR","url":"u3","body":"","updatedAt":"2026-09-01T00:00:00Z",
+ "labels":{"nodes":[]},"assignees":{"totalCount":0},"comments":{"totalCount":0,"nodes":[]},
+ "closedByPullRequestsReferences":{"nodes":[{"state":"OPEN"}]},"timelineItems":{"nodes":[]}},
+{"number":4,"title":"Only closed PR","url":"u4","body":null,"updatedAt":"2026-09-01T00:00:00Z",
+ "labels":{"nodes":[]},"assignees":{"totalCount":0},"comments":{"totalCount":0,"nodes":[]},
+ "closedByPullRequestsReferences":{"nodes":[{"state":"CLOSED"}]},
+ "timelineItems":{"nodes":[{"isCrossRepository":false,"source":{"state":"MERGED"}},{"isCrossRepository":false,"source":{}},{"isCrossRepository":true,"source":{"state":"OPEN"}}]}},
+{"number":5,"title":"Mentioned by open PR","url":"u5","body":"","updatedAt":"2026-09-01T00:00:00Z",
+ "labels":{"nodes":[]},"assignees":{"totalCount":0},"comments":{"totalCount":0,"nodes":[]},
+ "closedByPullRequestsReferences":{"nodes":[]},
+ "timelineItems":{"nodes":[{"isCrossRepository":false,"source":{"state":"OPEN"}}]}}
+]}}}}

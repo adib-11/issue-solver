@@ -1,0 +1,5 @@
+interface:
+  display_name: "Solve Issue"
+  short_description: "Pick a GitHub issue, brief it, implement it, review it, and open a PR"
+policy:
+  allow_implicit_invocation: false

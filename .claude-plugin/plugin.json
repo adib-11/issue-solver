@@ -1,0 +1,14 @@
+{
+  "name": "solve-issue",
+  "version": "0.1.0",
+  "description": "Pick a GitHub issue, implement it test-first, review it, and open a PR.",
+  "license": "MIT",
+  "skills": [
+    "./skills/agent-brief",
+    "./skills/code-review",
+    "./skills/github",
+    "./skills/implement",
+    "./skills/solve-issue",
+    "./skills/tdd"
+  ]
+}
