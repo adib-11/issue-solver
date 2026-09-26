@@ -5,6 +5,8 @@ export type Config = {
   appId: string;
   privateKey: string;
   adminPassword: string;
+  /** Subscription token from `claude setup-token`; optional because the harness is chosen on the setup page. */
+  claudeOauthToken?: string;
   dbPath: string;
   port: number;
 };
@@ -30,6 +32,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     appId,
     privateKey,
     adminPassword,
+    claudeOauthToken: env.CLAUDE_CODE_OAUTH_TOKEN?.trim() || undefined,
     dbPath: env.DB_PATH || "/data/auto-solve.sqlite",
     port: Number(env.PORT || 3000),
   };

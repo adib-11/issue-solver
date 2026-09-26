@@ -318,3 +318,85 @@ describe("run anyway", () => {
     expect((await t.post("/api/jobs/999/run-anyway")).status).toBe(404);
   });
 });
+
+describe("harness setup", () => {
+  test("starts with no harness chosen and lists each harness with its login help", async () => {
+    t = setup();
+    expect(await t.json("/api/setup")).toEqual({
+      harness: null,
+      harnesses: [
+        { name: "claude-code", label: "Label of claude-code", loginHelp: "Log in to claude-code like this." },
+        { name: "other", label: "Label of other", loginHelp: "Log in to other like this." },
+      ],
+      auth: null,
+      paused: null,
+      credentialSince: null,
+    });
+  });
+
+  test("the chosen harness is stored and survives a restart; unknown harnesses are refused", async () => {
+    t = setup();
+    expect((await t.post("/api/setup", { harness: "claude-code" }, "PUT")).status).toBe(200);
+    expect((await t.post("/api/setup", { harness: "nope" }, "PUT")).status).toBe(400);
+    expect((await t.post("/api/setup", {}, "PUT")).status).toBe(400);
+    t.restart();
+    expect((await t.json("/api/setup")).harness).toBe("claude-code");
+  });
+
+  test("Test auth needs a chosen harness", async () => {
+    t = setup();
+    expect((await t.post("/api/setup/test-auth")).status).toBe(409);
+    expect(t.harnesses.map((h) => h.authChecks)).toEqual([0, 0]);
+  });
+
+  test("Test auth checks the chosen harness and records the result for the header", async () => {
+    t = setup();
+    await t.post("/api/setup", { harness: "other" }, "PUT");
+    const res = await t.post("/api/setup/test-auth");
+    expect(res.status).toBe(200);
+    expect((await res.json()).auth).toEqual({ state: "ok", checkedAt: "2026-01-01T00:00:00.000Z", log: "other auth: ok" });
+    expect(t.harnesses.map((h) => h.authChecks)).toEqual([0, 1]);
+    t.restart();
+    expect((await t.json("/api/setup")).auth.state).toBe("ok");
+  });
+
+  test("an auth or quota failure pauses the queue, and a passing Test auth resumes it", async () => {
+    t = setup();
+    await t.post("/api/setup", { harness: "claude-code" }, "PUT");
+    const [claude] = t.harnesses;
+    claude!.authState = "auth";
+    await t.post("/api/setup/test-auth");
+    expect(await t.json("/api/setup")).toMatchObject({ auth: { state: "auth" }, paused: expect.stringContaining("log in") });
+    claude!.authState = "quota";
+    await t.post("/api/setup/test-auth");
+    expect(await t.json("/api/setup")).toMatchObject({ auth: { state: "quota" }, paused: expect.stringContaining("quota") });
+    claude!.authState = "error";
+    await t.post("/api/setup/test-auth");
+    expect(await t.json("/api/setup")).toMatchObject({ auth: { state: "error" }, paused: expect.stringContaining("quota") });
+    claude!.authState = "ok";
+    await t.post("/api/setup/test-auth");
+    expect(await t.json("/api/setup")).toMatchObject({ auth: { state: "ok" }, paused: null });
+  });
+
+  test("choosing another harness forgets the previous auth result", async () => {
+    t = setup();
+    await t.post("/api/setup", { harness: "claude-code" }, "PUT");
+    await t.post("/api/setup/test-auth");
+    await t.post("/api/setup", { harness: "other" }, "PUT");
+    expect((await t.json("/api/setup")).auth).toBeNull();
+  });
+
+  test("shows how long the chosen harness's token has been in use, resetting when the token changes", async () => {
+    t = setup();
+    await t.post("/api/setup", { harness: "claude-code" }, "PUT");
+    expect((await t.json("/api/setup")).credentialSince).toBe("2026-01-01T00:00:00.000Z");
+    await t.clock.advance(86_400_000);
+    t.restart();
+    expect((await t.json("/api/setup")).credentialSince).toBe("2026-01-01T00:00:00.000Z");
+    t.harnesses[0]!.credential = "token-2";
+    t.restart();
+    expect((await t.json("/api/setup")).credentialSince).toBe("2026-01-02T00:00:00.000Z");
+    await t.post("/api/setup", { harness: "other" }, "PUT");
+    expect((await t.json("/api/setup")).credentialSince).toBeNull();
+  });
+});

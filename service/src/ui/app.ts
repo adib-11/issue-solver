@@ -2,6 +2,13 @@
 import { JOB_STATES, type Job, UNTRUSTED_AUTHOR } from "../jobs";
 
 type JobPage = { jobs: Job[]; page: number; pageSize: number; total: number };
+type Setup = {
+  harness: string | null;
+  harnesses: { name: string; label: string; loginHelp: string }[];
+  auth: { state: string; checkedAt: string; log: string } | null;
+  paused: string | null;
+  credentialSince: string | null;
+};
 
 const POLL_MS = 2000;
 const focusRing = "rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600";
@@ -33,7 +40,7 @@ let lastBody = "";
 
 function route() {
   const match = location.hash.match(/^#\/jobs\/(\d+)$/);
-  return match ? { jobId: Number(match[1]) } : { jobId: undefined };
+  return { jobId: match ? Number(match[1]) : undefined, setup: location.hash === "#/setup" };
 }
 
 function notice(text: string, isError = false) {
@@ -151,20 +158,92 @@ function renderJob(content: HTMLElement, job: Job) {
   );
 }
 
+const button = (id: string, textContent: string) =>
+  el("button", { id, type: "button", class: `rounded border border-slate-300 bg-white px-3 py-1 disabled:opacity-40 ${focusRing}`, textContent });
+
+/** POSTs or PUTs, keeping the button disabled while pending and reporting failure in status. */
+async function act(control: HTMLButtonElement | HTMLInputElement, status: HTMLElement, url: string, init: RequestInit, label: string) {
+  control.disabled = true;
+  status.textContent = `${label}…`;
+  const res = await fetch(url, { headers: { "Content-Type": "application/json" }, ...init }).catch(() => null);
+  control.disabled = false;
+  status.textContent = res?.ok ? "" : `${label} failed (${res ? res.status : "network error"}).`;
+  await refresh(); // re-renders only when the response changed the setup
+}
+
+const AUTH_LABELS: Record<string, string> = { ok: "auth ok", auth: "login needed", quota: "quota exhausted", error: "auth check failed" };
+
+function renderHeader(setup: Setup) {
+  const harness = setup.harnesses.find((h) => h.name === setup.harness);
+  const auth = !harness ? "not set up" : setup.auth ? (AUTH_LABELS[setup.auth.state] ?? setup.auth.state) : "auth not tested";
+  const warn = !harness || setup.auth?.state !== "ok" || setup.paused;
+  header.replaceChildren(
+    el("span", {}, "Harness: ", el("strong", { textContent: harness ? `${harness.label}, ${auth}` : auth })),
+    el("span", {}, "Queue: ", el("strong", { textContent: setup.paused ? `paused. ${setup.paused}` : "running" })),
+    el("a", { id: "setup-link", href: "#/setup", class: `text-blue-700 underline ${focusRing}`, textContent: "Setup" }),
+  );
+  header.className = `mb-4 flex flex-wrap items-center gap-x-4 gap-y-1 rounded border p-2 text-sm ${warn ? "border-amber-300 bg-amber-50" : "border-slate-200 bg-white"}`;
+}
+
+const DAY_MS = 86_400_000;
+function renderSetup(content: HTMLElement, setup: Setup) {
+  const status = el("p", { role: "status", class: "text-sm text-red-800" });
+  const choices = el("fieldset", { class: "flex flex-wrap gap-4" }, el("legend", { class: "sr-only", textContent: "Harness" }));
+  for (const h of setup.harnesses) {
+    const radio = el("input", { id: `harness-${h.name}`, type: "radio", name: "harness", value: h.name, checked: h.name === setup.harness, class: focusRing });
+    radio.addEventListener("change", () => act(radio, status, "/api/setup", { method: "PUT", body: JSON.stringify({ harness: h.name }) }, "Saving the harness"));
+    choices.append(el("label", { class: "flex items-center gap-2", htmlFor: radio.id }, radio, h.label));
+  }
+  const harness = setup.harnesses.find((h) => h.name === setup.harness);
+  const section = (title: string, ...children: Child[]) =>
+    el("section", { class: "rounded border border-slate-200 bg-white p-3" }, el("h3", { class: "mb-2 font-medium", textContent: title }), ...children);
+  const pre = (text: string) => el("pre", { class: "overflow-x-auto whitespace-pre-wrap break-words text-sm", textContent: text });
+
+  const parts: HTMLElement[] = [el("h2", { class: "text-lg font-semibold", textContent: "Setup" }), section("Choose the harness", choices)];
+  if (harness) {
+    parts.push(section(`Log in to ${harness.label}`, pre(harness.loginHelp)));
+    if (setup.credentialSince) {
+      const days = Math.floor((Date.now() - Date.parse(setup.credentialSince)) / DAY_MS);
+      parts.push(section("Token age", el("p", {}, `In use since `, time(setup.credentialSince), ` (${days} days). Tokens from claude setup-token last one year.`)));
+    }
+    const test = button("test-auth", "Test auth");
+    test.addEventListener("click", () => act(test, status, "/api/setup/test-auth", { method: "POST" }, "Test auth"));
+    parts.push(
+      section(
+        "Test auth",
+        el("div", { class: "flex flex-wrap items-center gap-2" }, test, status),
+        ...(setup.auth ? [el("p", { class: "mt-2" }, `Last result: ${AUTH_LABELS[setup.auth.state] ?? setup.auth.state}, `, time(setup.auth.checkedAt)), pre(setup.auth.log)] : []),
+      ),
+    );
+  } else parts.push(status);
+  content.replaceChildren(el("div", { class: "flex flex-col gap-3" }, ...parts));
+}
+
+const header = el("div", { id: "status", role: "status" });
 const content = el("div", { id: "content" });
-root.replaceChildren(el("h1", { class: "mb-4 text-xl font-bold" }, el("a", { href: "#/", class: focusRing, textContent: "auto-solve" })), content);
+root.replaceChildren(el("h1", { class: "mb-2 text-xl font-bold" }, el("a", { href: "#/", class: focusRing, textContent: "auto-solve" })), header, content);
 
 let latest = 0;
+let lastHeader = "";
+async function refreshHeader() {
+  const res = await fetch("/api/setup").catch(() => null);
+  const body = res?.ok ? await res.text() : "";
+  if (!body || body === lastHeader) return;
+  lastHeader = body;
+  renderHeader(JSON.parse(body));
+}
+
 async function refresh(showLoading = false) {
+  refreshHeader();
   const request = ++latest;
-  const { jobId } = route();
+  const { jobId, setup } = route();
   if (showLoading) {
     lastBody = "";
     content.replaceChildren(notice("Loading…"));
   }
   const query = new URLSearchParams({ page: String(view.page) });
   if (view.filter) query.set("state", view.filter);
-  const url = jobId === undefined ? `/api/jobs?${query}` : `/api/jobs/${jobId}`;
+  const url = setup ? "/api/setup" : jobId === undefined ? `/api/jobs?${query}` : `/api/jobs/${jobId}`;
   try {
     const res = await fetch(url);
     const body = await res.text();
@@ -173,7 +252,8 @@ async function refresh(showLoading = false) {
     if (body === lastBody) return; // unchanged: keep the DOM, and keyboard focus with it
     lastBody = body;
     const focusedId = document.activeElement?.id;
-    if (jobId === undefined) renderList(content, JSON.parse(body));
+    if (setup) renderSetup(content, JSON.parse(body));
+    else if (jobId === undefined) renderList(content, JSON.parse(body));
     else renderJob(content, JSON.parse(body));
     if (focusedId) document.getElementById(focusedId)?.focus(); // keep keyboard focus across re-renders
   } catch (err) {

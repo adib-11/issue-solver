@@ -21,5 +21,9 @@ export function openDb(path: string) {
     repo_id INTEGER PRIMARY KEY,
     scanned_at TEXT NOT NULL
   )`);
+  db.run(`CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  )`);
   return db;
 }

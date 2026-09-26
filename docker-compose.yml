@@ -9,6 +9,7 @@ services:
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/github_app_key
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
     secrets:
       - github_app_key
     volumes:

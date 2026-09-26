@@ -37,3 +37,8 @@ test("aborts with a clear message when the private key file cannot be read", () 
     `Cannot read GITHUB_APP_PRIVATE_KEY_FILE at ${missing}`,
   );
 });
+
+test("the Claude Code token is optional and trimmed", () => {
+  expect(loadConfig(full).claudeOauthToken).toBeUndefined();
+  expect(loadConfig({ ...full, CLAUDE_CODE_OAUTH_TOKEN: " sk-ant-oat01-x \n" }).claudeOauthToken).toBe("sk-ant-oat01-x");
+});

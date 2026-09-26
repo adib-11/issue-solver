@@ -1,0 +1,5 @@
+{
+  "exit": 1,
+  "stdout": [],
+  "stderr": "Error: unexpected failure while using token sk-ant-oat01-test-token\n    at main (cli.js:1:1)\n"
+}
