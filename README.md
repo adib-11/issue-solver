@@ -6,12 +6,10 @@ Requires the [`gh` CLI](https://cli.github.com), logged in (`gh auth login`), pl
 
 ## Install
 
-Replace `<owner>/issue-solver` with the GitHub repo this bundle is published at.
-
 ### skills.sh (Codex, Claude Code, Cursor, and other Agent Skills harnesses)
 
 ```bash
-npx skills add <owner>/issue-solver
+npx skills add adib-11/issue-solver
 ```
 
 Pick your harness when prompted, or pass `-a <agent>` (for example `-a codex`). All skills in `skills/` install together; `solve-issue` depends on the others.
@@ -21,7 +19,7 @@ Pick your harness when prompted, or pass `-a <agent>` (for example `-a codex`). 
 In Claude Code:
 
 ```
-/plugin marketplace add <owner>/issue-solver
+/plugin marketplace add adib-11/issue-solver
 /plugin install solve-issue@issue-solver
 ```
 
