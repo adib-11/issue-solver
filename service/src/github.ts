@@ -109,7 +109,9 @@ export function createGitHubClient(appId: string, privateKey: string): GitHub {
           body: JSON.stringify({ query: ISSUES_QUERY, variables: { owner, name, since: since ?? null, after } }),
         });
         const body = (await res.json()) as any;
-        if (body.errors) throw new Error(`GitHub GraphQL issues of ${repo.full_name}: ${JSON.stringify(body.errors)}`);
+        if (body.errors || !body.data?.repository) {
+          throw new Error(`GitHub GraphQL issues of ${repo.full_name}: ${JSON.stringify(body.errors ?? "repository not found")}`);
+        }
         const page = body.data.repository.issues;
         issues.push(...page.nodes);
         after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;

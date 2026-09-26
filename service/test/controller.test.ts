@@ -253,6 +253,27 @@ describe("intake filters", () => {
     expect((await t.json(`/api/jobs/${job.id}`)).skip_reason).toBe("closed");
   });
 
+  test("a filtered skip lifts when a later scan sees the issue reopened or free, keeping the trust check", async () => {
+    t = setup();
+    t.github.repos.set(10, [repo(1)]);
+    const taken = { assignees: { totalCount: 1 } };
+    t.github.issues.set(1, [issue(1), issue(2, taken), issue(3, { ...taken, authorAssociation: "NONE" })]);
+    await t.app.scan();
+    t.github.issues.set(1, [issue(1, { state: "CLOSED", updatedAt: "2026-01-01T00:00:30Z" }), issue(2, taken), issue(3, taken)]);
+    await t.clock.advance(60_000);
+    await t.app.scan();
+    expect(await jobStates()).toEqual({ 1: "skipped: closed", 2: "skipped: assigned", 3: "skipped: assigned" });
+    const later = "2026-01-01T00:01:30Z";
+    t.github.issues.set(1, [
+      issue(1, { updatedAt: later }),
+      issue(2, { updatedAt: later }),
+      issue(3, { authorAssociation: "NONE", updatedAt: later }),
+    ]);
+    await t.clock.advance(60_000);
+    await t.app.scan();
+    expect(await jobStates()).toEqual({ 1: "queued", 2: "queued", 3: "skipped: untrusted author" });
+  });
+
   test("open issues from every repo are queued oldest first", async () => {
     t = setup();
     t.github.repos.set(10, [repo(1), repo(2, "lib")]);

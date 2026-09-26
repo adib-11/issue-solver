@@ -14,8 +14,11 @@ const DIST = join(import.meta.dir, "../dist");
 const TRUSTED_AUTHORS = ["OWNER", "COLLABORATOR"];
 const STATIC_FILES: Record<string, string> = { "/": "index.html", "/app.js": "app.js", "/app.css": "app.css" };
 
+type ScannedRepo = { repo: Repo; issues: Issue[] };
+const FILTER_REASONS = ["closed", "assigned", "open closing PR", "referenced by open PR"] as const;
+
 /** The skill bundle's candidate filter (skills/solve-issue/scripts/candidates.jq): work already in flight. */
-function candidateSkipReason(issue: Issue) {
+function candidateSkipReason(issue: Issue): (typeof FILTER_REASONS)[number] | null {
   const open = (pr?: { state?: string }) => pr?.state === "OPEN";
   if (issue.assignees.totalCount > 0) return "assigned";
   if (issue.closedByPullRequestsReferences.nodes.some(open)) return "open closing PR";
@@ -36,12 +39,16 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock }
     (repo_id, repo_full_name, issue_number, issue_title, issue_url, state, skip_reason, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (repo_id, issue_number) DO NOTHING`);
-  const skipQueuedJob = db.query(`UPDATE jobs SET state = 'skipped', skip_reason = ?, updated_at = ?
-    WHERE repo_id = ? AND issue_number = ? AND state = 'queued'`);
+  // Filter skips follow the issue on every scan; untrusted-author skips wait for Run anyway.
+  const filterSkipped = `state = 'skipped' AND skip_reason IN (${FILTER_REASONS.map((r) => `'${r}'`).join(", ")})`;
+  const skipJob = db.query(`UPDATE jobs SET state = 'skipped', skip_reason = ?1, updated_at = ?2
+    WHERE repo_id = ?3 AND issue_number = ?4 AND (state = 'queued' OR (${filterSkipped} AND skip_reason <> ?1))`);
+  const liftSkip = db.query(`UPDATE jobs SET state = ?1, skip_reason = ?2, updated_at = ?3
+    WHERE repo_id = ?4 AND issue_number = ?5 AND ${filterSkipped}`);
   const getJob = db.query<Job, [number]>("SELECT * FROM jobs WHERE id = ?");
 
   /** Records one scan's results: every successfully listed repo, committed together so jobs are numbered oldest issue first. */
-  function record(scanned: { repo: Repo; issues: Issue[] }[], scanStart: number) {
+  function record(scanned: ScannedRepo[], scanStart: number) {
     const now = iso(clock.now());
     const found = scanned
       .flatMap(({ repo, issues }) => issues.map((issue) => ({ repo, issue })))
@@ -49,17 +56,18 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock }
     db.transaction(() => {
       for (const { repo, issue } of found) {
         const reason = issue.state === "CLOSED" ? "closed" : candidateSkipReason(issue);
-        if (reason) skipQueuedJob.run(reason, now, repo.id, issue.number);
-        if (issue.state === "CLOSED") continue;
         const skip = reason ?? (TRUSTED_AUTHORS.includes(issue.authorAssociation) ? null : UNTRUSTED_AUTHOR);
         const state = skip ? "skipped" : "queued";
+        if (reason) skipJob.run(reason, now, repo.id, issue.number);
+        else liftSkip.run(state, skip, now, repo.id, issue.number);
+        if (issue.state === "CLOSED") continue;
         insertJob.run(repo.id, repo.full_name, issue.number, issue.title, issue.url, state, skip, now, now);
       }
       for (const { repo } of scanned) setCursor.run(repo.id, iso(scanStart));
     })();
   }
 
-  async function scanRepo(installationId: number, repo: Repo) {
+  async function scanRepo(installationId: number, repo: Repo): Promise<ScannedRepo> {
     const cursor = getCursor.get(repo.id)?.scanned_at;
     const since = cursor ? iso(Date.parse(cursor) - CURSOR_OVERLAP_MS) : undefined;
     return { repo, issues: await github.listIssues(installationId, repo, since) };
@@ -70,7 +78,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock }
     if (scanning) return;
     scanning = true;
     const scanStart = clock.now();
-    const scanned: { repo: Repo; issues: Issue[] }[] = [];
+    const scanned: ScannedRepo[] = [];
     try {
       for (const installation of await github.listInstallations()) {
         const { login, type } = installation.account;
