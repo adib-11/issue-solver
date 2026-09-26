@@ -12,6 +12,7 @@ export function openDb(path: string) {
     issue_title TEXT NOT NULL,
     issue_url TEXT NOT NULL,
     state TEXT NOT NULL,
+    skip_reason TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (repo_id, issue_number)

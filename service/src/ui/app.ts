@@ -1,5 +1,5 @@
 // Dashboard. Everything from the API is rendered with textContent only; see scripts/no-html-insertion.sh.
-import { JOB_STATES, type Job } from "../jobs";
+import { JOB_STATES, type Job, UNTRUSTED_AUTHOR } from "../jobs";
 
 type JobPage = { jobs: Job[]; page: number; pageSize: number; total: number };
 
@@ -21,8 +21,11 @@ function el<K extends keyof HTMLElementTagNameMap>(
 }
 
 const time = (iso: string) => el("time", { dateTime: iso, textContent: new Date(iso).toLocaleString() });
-const badge = (state: string) =>
-  el("span", { class: "rounded bg-slate-200 px-2 py-0.5 text-xs font-medium whitespace-nowrap", textContent: state });
+const badge = (job: Job) =>
+  el("span", {
+    class: "rounded bg-slate-200 px-2 py-0.5 text-xs font-medium whitespace-nowrap",
+    textContent: job.skip_reason ? `${job.state}: ${job.skip_reason}` : job.state,
+  });
 
 const root = document.getElementById("app")!;
 const view = { filter: "", page: 1 };
@@ -79,7 +82,7 @@ function renderList(content: HTMLElement, data: JobPage) {
               { id: `job-${job.id}`, href: `#/jobs/${job.id}`, class: `flex flex-col gap-1 p-3 hover:bg-slate-50 sm:flex-row sm:items-center sm:gap-3 ${focusRing}` },
               el("span", { class: "shrink-0 text-sm text-slate-500", textContent: `${job.repo_full_name}#${job.issue_number}` }),
               el("span", { class: "min-w-0 flex-1 break-words", textContent: job.issue_title }),
-              el("span", { class: "flex items-center gap-2 text-xs text-slate-500" }, badge(job.state), time(job.created_at)),
+              el("span", { class: "flex items-center gap-2 text-xs text-slate-500" }, badge(job), time(job.created_at)),
             ),
           ),
         ),
@@ -105,6 +108,32 @@ function renderList(content: HTMLElement, data: JobPage) {
 }
 
 function renderJob(content: HTMLElement, job: Job) {
+  let runAnyway: HTMLElement | null = null;
+  if (job.state === "skipped" && job.skip_reason === UNTRUSTED_AUTHOR) {
+    const button = el("button", {
+      id: "run-anyway",
+      type: "button",
+      class: `rounded border border-slate-300 bg-white px-3 py-1 disabled:opacity-40 ${focusRing}`,
+      textContent: "Run anyway",
+    });
+    const status = el("span", { role: "status", class: "text-sm text-red-800" });
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      const res = await fetch(`/api/jobs/${job.id}/run-anyway`, { method: "POST" }).catch(() => null);
+      if (!res?.ok) {
+        button.disabled = false;
+        status.textContent = `Run anyway failed (${res ? res.status : "network error"}).`;
+      }
+      refresh();
+    });
+    runAnyway = el(
+      "div",
+      { class: "mt-3 flex flex-wrap items-center gap-2" },
+      el("span", { class: "text-sm text-slate-600", textContent: "Read the issue first: its author is not you or a collaborator." }),
+      button,
+      status,
+    );
+  }
   const row = (label: string, value: Child) =>
     el("div", { class: "grid gap-1 py-2 sm:grid-cols-[10rem_1fr]" }, el("dt", { class: "text-slate-500", textContent: label }), el("dd", { class: "break-words" }, value));
   content.replaceChildren(
@@ -113,11 +142,12 @@ function renderJob(content: HTMLElement, job: Job) {
     el(
       "dl",
       { class: "divide-y divide-slate-200 rounded border border-slate-200 bg-white px-3" },
-      row("State", badge(job.state)),
+      row("State", badge(job)),
       row("Issue", el("a", { href: job.issue_url, rel: "noreferrer", class: `text-blue-700 underline ${focusRing}`, textContent: `${job.repo_full_name}#${job.issue_number}` })),
       row("Created", time(job.created_at)),
       row("Updated", time(job.updated_at)),
     ),
+    ...(runAnyway ? [runAnyway] : []),
   );
 }
 
