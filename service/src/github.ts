@@ -60,29 +60,90 @@ export interface GitHub {
 
 const API = "https://api.github.com";
 
-export function createGitHubClient(appId: string, privateKey: string): GitHub {
+export type GitHubClientOptions = {
+  fetch?: typeof fetch;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  baseDelayMs?: number;
+};
+
+export function createGitHubClient(appId: string, privateKey: string, options: GitHubClientOptions = {}): GitHub {
+  const fetchFn = options.fetch ?? fetch;
+  const sleepFn = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const nowFn = options.now ?? (() => Date.now());
+  const baseDelayMs = options.baseDelayMs ?? 1000;
   const tokens = new Map<number, { token: string; expiresAt: number }>();
 
   function appJwt() {
-    const now = Math.floor(Date.now() / 1000);
+    const now = Math.floor(nowFn() / 1000);
     const b64 = (v: object) => Buffer.from(JSON.stringify(v)).toString("base64url");
     const body = `${b64({ alg: "RS256", typ: "JWT" })}.${b64({ iat: now - 60, exp: now + 540, iss: appId })}`;
     const signature = createSign("RSA-SHA256").update(body).sign(privateKey, "base64url");
     return `${body}.${signature}`;
   }
 
+  function computeDelay(res: Response | null, attempt: number): number {
+    let delay = baseDelayMs * Math.pow(2, attempt);
+    if (res) {
+      const retryAfter = res.headers.get("retry-after");
+      if (retryAfter) {
+        const seconds = parseFloat(retryAfter);
+        if (!isNaN(seconds)) delay = Math.max(delay, seconds * 1000);
+      }
+      const remaining = res.headers.get("x-ratelimit-remaining");
+      const reset = res.headers.get("x-ratelimit-reset");
+      if (remaining === "0" && reset) {
+        const resetSec = parseFloat(reset);
+        if (!isNaN(resetSec)) {
+          const diffMs = resetSec * 1000 - nowFn();
+          if (diffMs > 0) delay = Math.max(delay, diffMs);
+        }
+      }
+    }
+    return Math.max(0, delay);
+  }
+
   async function request(url: string, auth: string, init: RequestInit = {}) {
-    const res = await fetch(url.startsWith("http") ? url : API + url, {
+    const fullUrl = url.startsWith("http") ? url : API + url;
+    const reqInit: RequestInit = {
       ...init,
       headers: {
         Accept: "application/vnd.github+json",
         Authorization: `Bearer ${auth}`,
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "auto-solve",
+        ...init.headers,
       },
-    });
-    if (!res.ok) throw new Error(`GitHub ${init.method ?? "GET"} ${url} -> ${res.status}`);
-    return res;
+    };
+
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt <= 3; attempt++) {
+      let res: Response | null = null;
+      try {
+        res = await fetchFn(fullUrl, reqInit);
+      } catch (err) {
+        lastError = err as Error;
+        if (attempt < 3) {
+          await sleepFn(computeDelay(null, attempt));
+          continue;
+        }
+        throw lastError;
+      }
+
+      if (res.ok) return res;
+
+      const isRateLimit403 =
+        res.status === 403 &&
+        (res.headers.get("x-ratelimit-remaining") === "0" || res.headers.has("retry-after"));
+      const isTransient = (res.status >= 500 && res.status <= 599) || res.status === 429 || isRateLimit403;
+
+      if (!isTransient || attempt >= 3) {
+        throw new Error(`GitHub ${init.method ?? "GET"} ${url} -> ${res.status}`);
+      }
+
+      await sleepFn(computeDelay(res, attempt));
+    }
+    throw lastError ?? new Error(`GitHub ${init.method ?? "GET"} ${url} failed`);
   }
 
   async function paginate<T>(path: string, auth: string, pick: (body: any) => T[] = (b) => b) {

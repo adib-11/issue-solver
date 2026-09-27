@@ -79,6 +79,12 @@ const until = async (condition: () => boolean | Promise<boolean>) => {
   while (!(await condition())) await Bun.sleep(1);
 };
 
+const retry = async (id: number) => {
+  const res = await t.post(`/api/jobs/${id}/retry`);
+  expect(res.status).toBe(202);
+  return res.json() as Promise<any>;
+};
+
 describe("worker", () => {
   test("claims the oldest queued job and runs conventions in a hook-free checkout of it, mounted into the runner", async () => {
     const { harness } = await ready([issue(2), issue(1, { createdAt: "2025-01-01T00:00:00Z" })]);
@@ -895,6 +901,71 @@ describe("publish", () => {
     expect(job.attempts[0].result).toBe("publish: GitHub 502");
     expect(job.attempts[0].phases.at(-1)).toMatchObject({ name: "publish", outcome: "failed" });
   });
+
+  test("an attempt interrupted during publish is reconciled against the remote branch SHA and PR (no duplicate PR, no lost PR link)", async () => {
+    const { harness } = await ready();
+    let prCreated = false;
+    t.github.afterCreateDraftPullRequest = () => {
+      prCreated = true;
+      return new Promise(() => {}); // suspend mid-publish after PR creation
+    };
+    harness.script = [discovered(), ...solved()];
+    void t.app.work();
+    await until(() => prCreated);
+    expect(t.github.pulls).toHaveLength(1);
+    const prUrl = t.github.pulls[0]!.url;
+
+    // Simulate service restart mid-publish:
+    t.restart();
+    await t.app.start();
+
+    const job = await jobFor(1);
+    expect(job.state).toBe("pr_created");
+    expect(job.attempts[0]).toMatchObject({
+      result: `pr_created: ${prUrl}`,
+      branch: "agent/issue-1",
+      pr_url: prUrl,
+    });
+    expect(job.attempts[0].phases.at(-1)).toMatchObject({
+      name: "publish",
+      outcome: "ok",
+    });
+    expect(t.github.pulls).toHaveLength(1);
+
+    const retryRes = await t.post(`/api/jobs/${job.id}/retry`);
+    expect(retryRes.status).toBe(409);
+  });
+
+  test("an attempt interrupted during publish without a PR is marked failed with an interrupted reason, and Retry resumes at publish", async () => {
+    const { harness, remote } = await ready();
+    let pushed = false;
+    t.github.afterPush = () => {
+      pushed = true;
+      return new Promise(() => {}); // suspend mid-publish after push, before PR creation
+    };
+    harness.script = [discovered(), ...solved()];
+    void t.app.work();
+    await until(() => pushed);
+
+    // Simulate service restart mid-publish before PR creation:
+    t.restart();
+    await t.app.start();
+
+    const first = await jobFor(1);
+    expect(first.state).toBe("failed");
+    expect(first.attempts[0].result).toBe("Interrupted by a restart");
+    expect(first.resume_phase).toBe("publish");
+
+    // Retry resumes at publish
+    t.github.afterPush = undefined;
+    await retry(first.id);
+    await t.app.work();
+
+    const job = await jobFor(1);
+    expect(job.state).toBe("pr_created");
+    expect(t.github.pulls).toHaveLength(1);
+    expect(job.attempts[1].pr_url).toBe(t.github.pulls[0]!.url);
+  });
 });
 
 describe("review loop", () => {
@@ -1277,11 +1348,6 @@ describe("resume", () => {
   const headOf = (dir: string) => Bun.spawnSync(["git", "-C", dir, "rev-parse", "HEAD"]).stdout.toString().trim();
   const names = (attempt: any) => attempt.phases.map((p: any) => p.name);
   const reused = (attempt: any) => attempt.phases.filter((p: any) => p.outcome === "reused").map((p: any) => p.name);
-  const retry = async (id: number) => {
-    const res = await t.post(`/api/jobs/${id}/retry`);
-    expect(res.status).toBe(202);
-    return res.json() as Promise<any>;
-  };
 
   test("Retry after a checks timeout resumes at checks on the saved commit, reusing brief and implement", async () => {
     const { harness, remote } = await ready();

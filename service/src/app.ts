@@ -330,12 +330,33 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     }
   }
 
+  type InterruptedPublish = {
+    attemptId: number;
+    jobId: number;
+    issueNumber: number;
+    repoId: number;
+    commits: string;
+    branch: string | null;
+    phaseId: number;
+  };
+  const interruptedPublish = db.query<InterruptedPublish, []>(`
+    SELECT a.id AS attemptId, j.id AS jobId, j.issue_number AS issueNumber, j.repo_id AS repoId, a.commits, a.branch, p.id AS phaseId
+    FROM attempts a
+    JOIN jobs j ON j.id = a.job_id
+    JOIN phases p ON p.attempt_id = a.id AND p.name = 'publish' AND p.finished_at IS NULL
+    WHERE a.finished_at IS NULL AND j.state = 'running'
+  `).get();
+
   // Only one attempt runs at a time, so any attempt still unfinished at startup was cut off by a restart.
+  // Other interrupted attempts fail immediately; an attempt interrupted during publish is reconciled against GitHub.
   db.transaction(() => {
     const at = now();
-    db.run("UPDATE phases SET finished_at = ?, outcome = 'interrupted' WHERE finished_at IS NULL", [at]);
-    db.run("UPDATE attempts SET finished_at = ?, result = ? WHERE finished_at IS NULL", [at, INTERRUPTED]);
-    db.run("UPDATE jobs SET state = 'failed', phase = NULL, updated_at = ? WHERE state = 'running'", [at]);
+    const excludePhase = interruptedPublish ? `AND id != ${interruptedPublish.phaseId}` : "";
+    db.run(`UPDATE phases SET finished_at = ?, outcome = 'interrupted' WHERE finished_at IS NULL ${excludePhase}`, [at]);
+    const excludeAttempt = interruptedPublish ? `AND id != ${interruptedPublish.attemptId}` : "";
+    db.run(`UPDATE attempts SET finished_at = ?, result = ? WHERE finished_at IS NULL ${excludeAttempt}`, [at, INTERRUPTED]);
+    const excludeJob = interruptedPublish ? `AND id != ${interruptedPublish.jobId}` : "";
+    db.run(`UPDATE jobs SET state = 'failed', phase = NULL, updated_at = ? WHERE state = 'running' ${excludeJob}`, [at]);
   })();
 
   const claimJob = db.query<Job, [string]>(`UPDATE jobs SET state = 'running', phase = 'checkout', updated_at = ?
@@ -366,6 +387,46 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   const getRepo = db.query<RepoRow, [number]>("SELECT * FROM repos WHERE id = ?");
   const saveConventions = db.query("UPDATE repos SET conventions = ?, conventions_hash = ?, conventions_at = ? WHERE id = ?");
   const parse = <T>(json: string | null): T | null => (json === null ? null : JSON.parse(json));
+
+  async function reconcile() {
+    if (!interruptedPublish) return;
+    const { attemptId, jobId, issueNumber, repoId, commits, phaseId } = interruptedPublish;
+    const branch = interruptedPublish.branch || branchFor(issueNumber);
+    const repo = getRepo.get(repoId);
+    const head = (parse<Commit[]>(commits) ?? []).at(-1)?.sha;
+    if (!repo || !head) {
+      failInterrupted();
+      return;
+    }
+    try {
+      const remote = await github.branchSha(repo.installation_id, repo.full_name, branch);
+      if (remote && remote === head) {
+        const pr = await github.findPullRequest(repo.installation_id, repo.full_name, branch);
+        if (pr) {
+          const at = now();
+          setBranch.run(branch, attemptId);
+          setPrUrl.run(pr.url, attemptId);
+          endPhase.run(at, "ok", "Reconciled against remote branch and PR.", JSON.stringify({ branch, pr_url: pr.url }), phaseId);
+          endAttempt.run(at, `pr_created: ${pr.url}`, attemptId);
+          endJob.run("pr_created", null, at, jobId);
+          return;
+        }
+      }
+      failInterrupted();
+    } catch (err) {
+      console.error("Reconciliation failed:", err);
+      failInterrupted();
+    }
+
+    function failInterrupted() {
+      const at = now();
+      endPhase.run(at, "interrupted", "", null, phaseId);
+      endAttempt.run(at, INTERRUPTED, attemptId);
+      endJob.run("failed", null, at, jobId);
+    }
+  }
+
+  const reconciling = reconcile();
 
   function redact(log: string) {
     for (const h of harnesses) if (h.credential) log = log.replaceAll(h.credential, "[redacted]");
@@ -777,6 +838,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   function work() {
     working ??= (async () => {
       try {
+        await reconciling;
         while (await runNext());
       } finally {
         working = undefined;
@@ -787,6 +849,10 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
 
   const http = new Hono();
   http.use(basicAuth({ username: "admin", password: config.adminPassword }));
+  http.use(async (c, next) => {
+    await reconciling;
+    await next();
+  });
   http.use(async (c, next) => {
     if (c.req.method !== "GET" && c.req.method !== "HEAD" && c.req.header("origin") !== new URL(c.req.url).origin) {
       return c.json({ error: "Origin does not match" }, 403);
@@ -928,6 +994,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
       await runner.cleanup().catch((err) => console.error("Runner cleanup failed:", err));
       mkdirSync(config.workspacesDir, { recursive: true });
       for (const entry of readdirSync(config.workspacesDir)) rmSync(join(config.workspacesDir, entry), { recursive: true, force: true });
+      await reconciling;
       await scan();
       void work();
       stopTimer = clock.every(SCAN_INTERVAL_MS, async () => {
