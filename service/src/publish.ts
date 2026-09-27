@@ -1,4 +1,4 @@
-import type { Brief, CommandRuns, Conventions, IssueSnapshot } from "./jobs";
+import type { Brief, CommandRuns, Conventions, Finding, IssueSnapshot, ReviewRound } from "./jobs";
 import type { Implemented } from "./implement";
 
 export const branchFor = (issueNumber: number) => `agent/issue-${issueNumber}`;
@@ -14,6 +14,41 @@ const commandList = ({ runs, skipped }: CommandRuns, withBase: boolean) =>
         .map((r) => `- \`${r.command}\`${withBase ? (r.on === "base" ? " on the base with the new tests" : " on the change") : ""}: exit ${r.exit_code}`)
         .join("\n");
 
+/** One axis's findings across the rounds, split by the fix decisions of the round that found them. */
+function axisReview(rounds: ReviewRound[], pick: (round: ReviewRound) => Finding[]) {
+  const line = (f: Finding, reason?: string) => `- \`${f.id}\` ${f.kind}: ${f.rationale}${reason ? ` — ${reason}` : ""}`;
+  const fixed: string[] = [];
+  const rejected: string[] = [];
+  const open: string[] = [];
+  for (const round of rounds) {
+    const decisions = new Map(round.decisions.map((d) => [d.id, d]));
+    for (const finding of pick(round)) {
+      const decision = decisions.get(finding.id);
+      if (decision?.decision === "fixed") fixed.push(line(finding, decision.reason));
+      else if (decision?.decision === "rejected") rejected.push(line(finding, decision.reason));
+      else open.push(line(finding));
+    }
+  }
+  const parts: string[] = [];
+  if (fixed.length) parts.push("Fixed:", ...fixed);
+  if (rejected.length) parts.push("Rejected:", ...rejected);
+  if (open.length) parts.push("Open (not fixed):", ...open);
+  return parts.length ? parts.join("\n") : "No findings.";
+}
+
+/** Both axes' findings, split into fixed, rejected (with reasons), and still open; open findings do not block. */
+function reviewSection(rounds: ReviewRound[]) {
+  return `## Review
+
+### Standards
+
+${axisReview(rounds, (r) => r.standards)}
+
+### Spec
+
+${axisReview(rounds, (r) => r.spec)}`;
+}
+
 /** A fixed body rendered from the phases' data. */
 export function prBody(p: {
   issue: IssueSnapshot;
@@ -21,6 +56,7 @@ export function prBody(p: {
   implemented: Implemented;
   redGreen: CommandRuns;
   checks: CommandRuns;
+  review: ReviewRound[];
   harness: string;
 }) {
   const tests = p.implemented.tests_added.map((t) => `- \`${t.file}\`: ${t.name}`).join("\n") || "None: the repo has no tests.";
@@ -49,6 +85,8 @@ ${commandList(p.redGreen, true)}
 ## Checks
 
 ${commandList(p.checks, false)}
+
+${reviewSection(p.review)}
 
 ---
 

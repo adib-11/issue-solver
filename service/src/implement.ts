@@ -72,29 +72,47 @@ export const gitConfigHash = (workspace: string) => new Bun.CryptoHasher("sha256
 
 /**
  * Stages everything the agent changed since head, folding in any commit the agent made, and returns why the change
- * cannot be committed, or null. testFiles are the test files the agent reports; hasTests says whether it must.
+ * cannot be committed, or the changed paths (empty when nothing changed).
  */
-export async function changeError(workspace: string, head: string, configHash: string, hasTests: boolean, testFiles: string[]) {
+export async function stageChange(
+  workspace: string,
+  head: string,
+  configHash: string,
+): Promise<{ error: string } | { changed: { mode: string; status: string; path: string }[] }> {
   // Checked before any git call here: an edited config would run its commands on the controller.
-  if (gitConfigHash(workspace) !== configHash) return "the agent edited .git/config";
+  if (gitConfigHash(workspace) !== configHash) return { error: "the agent edited .git/config" };
   const git = (args: string[]) => $`git -C ${workspace} ${args}`.quiet();
   await git(["reset", "-q", "--soft", head]);
   await git(["add", "-A"]);
   // ":old-mode new-mode old-sha new-sha status\0path\0" per changed path.
   const fields = (await git(["diff", "--cached", "--raw", "-z", "--no-renames", head])).text().split("\0");
-  const changed: { mode: string; path: string }[] = [];
-  for (let i = 0; i + 1 < fields.length; i += 2) changed.push({ mode: fields[i]!.split(" ")[1]!, path: fields[i + 1]! });
+  const changed: { mode: string; status: string; path: string }[] = [];
+  for (let i = 0; i + 1 < fields.length; i += 2) {
+    const [raw, path] = [fields[i]!.split(" "), fields[i + 1]!];
+    changed.push({ mode: raw[1]!, status: raw[4]!, path });
+  }
 
-  if (!changed.length) return "the diff is empty";
   const workflow = changed.find((c) => c.path.startsWith(".github/workflows/"));
-  if (workflow) return `the diff edits CI configuration: ${workflow.path}`;
+  if (workflow) return { error: `the diff edits CI configuration: ${workflow.path}` };
   for (const { mode, path } of changed) {
     if (mode !== "120000") continue;
     const target = relative(workspace, resolve(dirname(join(workspace, path)), readlinkSync(join(workspace, path))));
     if (target === ".." || target.startsWith("../") || isAbsolute(target) || target === ".git" || target.startsWith(".git/")) {
-      return `the diff adds a symlink that points outside the checkout: ${path}`;
+      return { error: `the diff adds a symlink that points outside the checkout: ${path}` };
     }
   }
+  return { changed };
+}
+
+/**
+ * Stages everything the agent changed since head, folding in any commit the agent made, and returns why the change
+ * cannot be committed, or null. testFiles are the test files the agent reports; hasTests says whether it must.
+ */
+export async function changeError(workspace: string, head: string, configHash: string, hasTests: boolean, testFiles: string[]) {
+  const staged = await stageChange(workspace, head, configHash);
+  if ("error" in staged) return staged.error;
+  const { changed } = staged;
+  if (!changed.length) return "the diff is empty";
   if (!hasTests) return testFiles.length ? "the repo has no tests, but the agent reports adding some" : null;
   if (!testFiles.length) return "the repo has tests, but the diff adds no test";
   // A deleted file is not a test added.
