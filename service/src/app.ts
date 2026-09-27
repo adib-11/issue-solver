@@ -13,7 +13,7 @@ import type { GitHub, Issue, Repo } from "./github";
 import { branchFor, prBody, prTitle } from "./publish";
 import { type AuthCheckState, type Harness, type RunError, type RunOptions, schemaError, type SetupView } from "./harness";
 import { type Attempt, type Brief, type CommandRuns, type Commit, type Conventions, JOB_STATES, type IssueSnapshot, type Job, type JobDetail, NO_CHECKS, type Phase, type RepoView, type ReviewRound, TRUSTED_AUTHORS, UNTRUSTED_AUTHOR } from "./jobs";
-import { FIX_SCHEMA, FIX_TIMEOUT_MS, fixError, fixPrompt, REVIEW_ROUNDS, REVIEW_SCHEMA, REVIEW_TIMEOUT_MS, type Fixed, type Reviewed, specPrompt, standardsPrompt } from "./review";
+import { type Change, FIX_SCHEMA, FIX_TIMEOUT_MS, fixError, fixPrompt, REVIEW_ROUNDS, REVIEW_SCHEMA, REVIEW_TIMEOUT_MS, type Fixed, type Reviewed, specPrompt, standardsPrompt } from "./review";
 import type { Runner, Sandbox } from "./runner";
 import { checks, redGreen, type Verified } from "./verify";
 
@@ -314,23 +314,23 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
    */
   async function reviewLoop(
     claimed: Claimed,
-    baseSha: string,
     configHash: string,
-    commits: Commit[],
+    change: Change,
     conventions: Conventions,
     issue: IssueSnapshot,
     brief: Brief,
-  ): Promise<{ rounds: ReviewRound[]; head: string } | null> {
+    latestChecks: CommandRuns,
+  ): Promise<{ rounds: ReviewRound[]; head: string; checks: CommandRuns } | null> {
     const { workspace } = claimed;
     const rounds: ReviewRound[] = [];
-    let head = commits[commits.length - 1]!.sha;
+    let head = change.commits[change.commits.length - 1]!.sha;
     while (rounds.length < REVIEW_ROUNDS) {
-      const standards = await runPhase(claimed, "review/standards", { prompt: standardsPrompt(baseSha, commits, conventions), schema: REVIEW_SCHEMA, timeoutMs: REVIEW_TIMEOUT_MS });
+      const standards = await runPhase(claimed, "review/standards", { prompt: standardsPrompt(change, conventions), schema: REVIEW_SCHEMA, timeoutMs: REVIEW_TIMEOUT_MS });
       if (!standards.ok) {
         harnessFailed(claimed, "review/standards", standards.error);
         return null;
       }
-      const spec = await runPhase(claimed, "review/spec", { prompt: specPrompt(baseSha, commits, brief, issue), schema: REVIEW_SCHEMA, timeoutMs: REVIEW_TIMEOUT_MS });
+      const spec = await runPhase(claimed, "review/spec", { prompt: specPrompt(change, brief, issue), schema: REVIEW_SCHEMA, timeoutMs: REVIEW_TIMEOUT_MS });
       if (!spec.ok) {
         harnessFailed(claimed, "review/spec", spec.error);
         return null;
@@ -344,7 +344,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
       const fixed = await runPhase(
         claimed,
         "fix",
-        { prompt: fixPrompt(baseSha, commits, conventions, findings), schema: FIX_SCHEMA, timeoutMs: FIX_TIMEOUT_MS },
+        { prompt: fixPrompt(change, conventions, findings), schema: FIX_SCHEMA, timeoutMs: FIX_TIMEOUT_MS },
         (output) => fixError(output, findings),
       );
       if (!fixed.ok) {
@@ -352,20 +352,27 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
         return null;
       }
       round.decisions = (fixed.output as Fixed).decisions;
+      if (!round.decisions.some((d) => d.decision === "fixed")) break; // a round that fixes nothing ends the loop
+      // A fix is not a feature change, so the tests-required rule does not apply: only the generic diff rules do.
       const staged = await stageChange(workspace, head, configHash);
       if ("error" in staged) {
         finish(claimed, "failed", `fix: ${staged.error}`);
         return null;
       }
-      if (!staged.changed.length) break; // a round that fixed nothing ends the loop
+      // A "fixed" decision with no change would let the PR claim a fix that never happened.
+      if (!staged.changed.length) {
+        finish(claimed, "failed", "fix: the phase marked findings fixed but changed nothing");
+        return null;
+      }
       const fix = await commitChange(workspace, (fixed.output as Fixed).commit_message);
       addCommit.run(JSON.stringify(fix), claimed.attemptId);
-      commits.push(fix);
+      change.commits.push(fix);
       head = fix.sha;
       const rechecked = await verifyPhase(claimed, "checks", () => checks(sandbox, workspace, head, conventions));
       if (!rechecked) return null; // failing checks after the loop fail the attempt, with no PR
+      latestChecks = rechecked;
     }
-    return { rounds, head };
+    return { rounds, head, checks: latestChecks };
   }
 
   async function runAttempt(claimed: Claimed) {
@@ -438,9 +445,9 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     if (!redGreenRuns) return;
     const checkRuns = await verifyPhase(claimed, "checks", () => checks(sandbox, workspace, head.sha, conventions));
     if (!checkRuns) return;
-    const review = await reviewLoop(claimed, baseSha, configHash, [head], conventions, issue, brief);
+    const review = await reviewLoop(claimed, configHash, { base: baseSha, commits: [head] }, conventions, issue, brief, checkRuns);
     if (!review) return;
-    const body = prBody({ issue, brief, implemented: implemented.output as Implemented, redGreen: redGreenRuns, checks: checkRuns, review: review.rounds, harness: claimed.harness.label });
+    const body = prBody({ issue, brief, implemented: implemented.output as Implemented, redGreen: redGreenRuns, checks: review.checks, review: review.rounds, harness: claimed.harness.label });
     await publish(claimed, repo, review.head, prTitle(issue, conventions, commit_message), body);
   }
 

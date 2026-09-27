@@ -1037,6 +1037,17 @@ describe("review loop", () => {
     expect(t.github.pulls).toHaveLength(0);
   });
 
+  test("a fix that marks a finding fixed but changes nothing fails the attempt, so the PR cannot claim an unfixed finding", async () => {
+    const { harness } = await ready();
+    harness.script = [discovered(), briefed(), implemented(), reviewing(STANDARD), reviewing(), fixing({}, [{ id: "S1", decision: "fixed", reason: "done" }])];
+    await t.app.work();
+    const job = await jobFor(1);
+    expect(job.state).toBe("failed");
+    expect(job.attempts[0].result).toBe("fix: the phase marked findings fixed but changed nothing");
+    expect(job.attempts[0].commits).toHaveLength(1);
+    expect(t.github.pulls).toHaveLength(0);
+  });
+
   const invalid: Record<string, { decisions: Decision[]; message?: string; reason: string }> = {
     "a decision for an unknown finding": { decisions: [{ id: "X", decision: "rejected", reason: "nope" }], reason: "decision X does not match a finding" },
     "two decisions for one finding": {
