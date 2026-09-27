@@ -430,10 +430,12 @@ describe("brief", () => {
     expect((await t.post(`/api/jobs/${id}/retry`)).status).toBe(409);
   });
 
-  test("Retry is refused on a job that is not needs_info, and on an unknown job", async () => {
+  test("Retry is refused with 409 when the job is neither needs_info nor failed, and 404 when unknown", async () => {
     await ready();
     const id = (await jobFor(1)).id;
-    expect((await t.post(`/api/jobs/${id}/retry`)).status).toBe(409);
+    const res = await t.post(`/api/jobs/${id}/retry`);
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toContain("needs_info and failed");
     expect((await jobFor(1)).state).toBe("queued");
     expect((await t.post("/api/jobs/99/retry")).status).toBe(404);
   });
@@ -1165,5 +1167,359 @@ describe("review loop", () => {
     expect(run.prompt).toContain(CONVENTIONS.commit_style);
     expect(run.timeoutMs).toBe(FIX_TIMEOUT_MS);
     expect(run.schema.required).toEqual(["decisions", "commit_message"]);
+  });
+});
+
+describe("time budgets", () => {
+  const FIX = { id: "S1", kind: "possible Duplicated Code", quote: "const x = 1;", rationale: "the same expression appears twice" };
+  const reviewing = (finding?: Finding) => reviewed({ findings: finding ? [finding] : [] });
+  const fixing = (files: Record<string, string>, decisions: Decision[]): ((options: RunOptions) => RunResult) =>
+    ({ workspace }) => {
+      for (const [path, content] of Object.entries(files)) {
+        mkdirSync(dirname(join(workspace, path)), { recursive: true });
+        writeFileSync(join(workspace, path), content);
+      }
+      return { ok: true, output: { decisions, commit_message: "Address the review" }, log: "fix log" };
+    };
+
+  test("every agent phase gets its own limit, and every sandbox run the checks limit", async () => {
+    const { harness } = await ready();
+    harness.script = [
+      discovered(),
+      briefed(),
+      implemented(),
+      reviewing(FIX),
+      reviewing(),
+      fixing({ "src/f.ts": "export const f = (n: number) => n + 1; // fixed\n" }, [{ id: "S1", decision: "fixed", reason: "tweaked it" }]),
+      reviewing(),
+      reviewing(),
+    ];
+    await t.app.work();
+
+    const limits = Object.fromEntries(harness.runs.map((run, i) => [i, run.timeoutMs]));
+    expect(limits).toEqual({
+      0: 10 * 60_000, // conventions
+      1: 10 * 60_000, // brief
+      2: 30 * 60_000, // implement
+      3: 10 * 60_000, // review/standards
+      4: 10 * 60_000, // review/spec
+      5: 20 * 60_000, // fix
+      6: 10 * 60_000,
+      7: 10 * 60_000,
+    });
+    expect(t.sandbox.runs.length).toBeGreaterThan(0);
+    for (const run of t.sandbox.runs) expect(run.timeoutMs).toBe(15 * 60_000);
+  });
+
+  test("a harness timeout in implement fails the attempt naming the phase, with no PR", async () => {
+    const { harness } = await ready();
+    harness.script = [discovered(), briefed(), () => ({ ok: false, error: "timeout", log: "x" })];
+    await t.app.work();
+    expect((await jobFor(1)).attempts[0]).toMatchObject({ result: "implement: timeout", commits: [] });
+    expect(t.github.calls.some((c) => c.op === "push" || c.op === "createDraftPullRequest")).toBe(false);
+    expect(t.github.pulls).toHaveLength(0);
+  });
+
+  test("the 2-hour cap clamps the next phase's limit to the time left", async () => {
+    const { harness } = await ready();
+    harness.script = [
+      discovered(),
+      briefed(),
+      async (options) => {
+        const result = implemented()(options);
+        await t.clock.advance(2 * 60 * 60_000 - 5 * 60_000); // 5 minutes of the cap left
+        return result;
+      },
+      reviewed(),
+      reviewed(),
+    ];
+    await t.app.work();
+
+    expect(harness.runs[2]!.timeoutMs).toBe(30 * 60_000); // implement still gets its full limit
+    expect(t.sandbox.runs[0]!.timeoutMs).toBe(5 * 60_000); // red/green's first run: min(15m, 5m left)
+  });
+
+  test("an exhausted cap fails the attempt naming the phase, and no later phase runs", async () => {
+    const { harness } = await ready();
+    harness.script = [
+      async () => {
+        await t.clock.advance(2 * 60 * 60_000); // the whole cap, during conventions
+        return discovered()();
+      },
+      briefed(),
+      implemented(),
+      reviewed(),
+      reviewed(),
+    ];
+    await t.app.work();
+    const job = await jobFor(1);
+    expect(job.state).toBe("failed");
+    expect(job.attempts[0].result).toBe("brief: timeout (the attempt reached its 2-hour limit)");
+    expect(job.attempts[0].phases.map((p: any) => p.name)).toEqual(["conventions", "brief"]);
+    expect(job.attempts[0].phases[1]).toMatchObject({ outcome: "timeout", output: null });
+    expect(harness.runs).toHaveLength(1); // the brief phase never started
+    expect(t.github.pulls).toHaveLength(0);
+  });
+});
+
+describe("resume", () => {
+  const STANDARD: Finding = { id: "S1", kind: "possible Duplicated Code", quote: "const x = 1;", rationale: "the same expression appears twice" };
+  const reviewing = (finding?: Finding) => reviewed({ findings: finding ? [finding] : [] });
+  const fixing = (files: Record<string, string>, decisions: Decision[]): ((options: RunOptions) => RunResult) =>
+    ({ workspace }) => {
+      for (const [path, content] of Object.entries(files)) {
+        mkdirSync(dirname(join(workspace, path)), { recursive: true });
+        writeFileSync(join(workspace, path), content);
+      }
+      return { ok: true, output: { decisions, commit_message: "Address the review" }, log: "fix log" };
+    };
+  const remoteSha = async (remote: string, ref: string) => (await $`git -C ${remote} rev-parse ${ref}`.text()).trim();
+  const headOf = (dir: string) => Bun.spawnSync(["git", "-C", dir, "rev-parse", "HEAD"]).stdout.toString().trim();
+  const names = (attempt: any) => attempt.phases.map((p: any) => p.name);
+  const reused = (attempt: any) => attempt.phases.filter((p: any) => p.outcome === "reused").map((p: any) => p.name);
+  const retry = async (id: number) => {
+    const res = await t.post(`/api/jobs/${id}/retry`);
+    expect(res.status).toBe(202);
+    return res.json() as Promise<any>;
+  };
+
+  test("Retry after a checks timeout resumes at checks on the saved commit, reusing brief and implement", async () => {
+    const { harness, remote } = await ready();
+    const suite = t.sandbox.script;
+    t.sandbox.script = (command, dir) => (command === "bun run typecheck" ? "timeout" : suite(command, dir));
+    harness.script = [discovered(), briefed(), implemented()];
+    await t.app.work();
+    const first = await jobFor(1);
+    expect(first).toMatchObject({ state: "failed", resume_phase: "checks", attempts: [{ result: "checks: timeout" }] });
+    const head = first.attempts[0].commits[0].sha;
+
+    await retry(first.id);
+    let checkedSha = "";
+    t.sandbox.script = (command, dir) => {
+      if (command === "bun test") checkedSha = headOf(dir); // red/green is reused, so this is the checks run
+      return suite(command, dir);
+    };
+    harness.script = [reviewed(), reviewed()]; // only the reviews run: brief and implement are reused
+    await t.app.work();
+
+    const job = await jobFor(1);
+    expect(job.state).toBe("pr_created");
+    const [a1, a2] = job.attempts;
+    expect(a2.resumed_from).toBe(a1.id);
+    expect(reused(a2)).toEqual(["brief", "implement", "red/green"]);
+    expect(names(a2)).toEqual(["brief", "implement", "red/green", "checks", "review/standards", "review/spec", "publish"]);
+    expect(a2.phases[0]).toMatchObject({ outcome: "reused", log: "" });
+    expect(harness.runs).toHaveLength(5); // 3 in the first attempt, then the 2 reviews
+    expect(a2.commits[0].sha).toBe(head);
+    expect(checkedSha).toBe(head);
+    expect(await remoteSha(remote, "agent/issue-1")).toBe(head);
+  });
+
+  test("Retry after an implement timeout reuses the saved brief and issue snapshot", async () => {
+    const { harness } = await ready();
+    t.github.bodies.set("octo/app#1", "Original body");
+    harness.script = [discovered(), briefed(), () => ({ ok: false, error: "timeout", log: "x" })];
+    await t.app.work();
+    const first = await jobFor(1);
+    expect(first).toMatchObject({ state: "failed", resume_phase: "implement", attempts: [{ result: "implement: timeout" }] });
+
+    t.github.bodies.set("octo/app#1", "Changed body");
+    await retry(first.id);
+    const before = harness.runs.length;
+    harness.script = [implemented(), reviewed(), reviewed()];
+    await t.app.work();
+
+    const job = await jobFor(1);
+    expect(job.state).toBe("pr_created");
+    const [a1, a2] = job.attempts;
+    expect(a2.resumed_from).toBe(a1.id);
+    expect(reused(a2)).toEqual(["brief"]);
+    // The brief was not re-run: no session saw the edited body, and the implement prompt carries the saved brief.
+    expect(harness.runs.some((r) => r.prompt.includes("Changed body"))).toBe(false);
+    const added = harness.runs.slice(before);
+    expect(added[0]!.prompt).toContain(BRIEF.brief);
+    expect(a2.issue.body).toBe("Original body");
+  });
+
+  test("Retry inside the review loop resumes at the next round on the last verified fix commit", async () => {
+    const { harness } = await ready();
+    const fix1 = "export const f = (n: number) => n + 1; // r1\n";
+    harness.script = [
+      discovered(),
+      briefed(),
+      implemented(),
+      reviewing(STANDARD),
+      reviewing(),
+      fixing({ "src/f.ts": fix1 }, [{ id: "S1", decision: "fixed", reason: "tweaked it in round 1" }]),
+      reviewing(),
+      () => ({ ok: false, error: "timeout", log: "x" }), // review/spec in round 2
+    ];
+    await t.app.work();
+    const first = await jobFor(1);
+    expect(first).toMatchObject({ state: "failed", resume_phase: "review", attempts: [{ result: "review/spec: timeout" }] });
+    const fix1Sha = first.attempts[0].commits[1].sha;
+
+    await retry(first.id);
+    harness.script = [
+      reviewing(STANDARD),
+      reviewing(),
+      fixing({ "src/f.ts": "export const f = (n: number) => n + 1; // r2\n" }, [{ id: "S1", decision: "fixed", reason: "tweaked it in round 2" }]),
+      reviewing(STANDARD),
+      reviewing(),
+    ];
+    await t.app.work();
+
+    const job = await jobFor(1);
+    expect(job.state).toBe("pr_created");
+    const [a1, a2] = job.attempts;
+    expect(a2.resumed_from).toBe(a1.id);
+    // Round 1 is carried over, so the loop stops at the cap after rounds 1, 2, and 3.
+    expect(a2.commits.map((c: any) => c.sha)).toEqual([a1.commits[0].sha, fix1Sha, expect.any(String)]);
+    expect(names(a2).filter((n: string) => n === "review/standards")).toHaveLength(3); // round 1 reused, then rounds 2 and 3
+    const { body } = t.github.pulls[0]!;
+    expect(body).toContain("tweaked it in round 1");
+    expect(body).toContain("Open (not fixed):");
+  });
+
+  test("a fix commit whose re-check timed out is not reused: the loop restarts from the last verified commit", async () => {
+    const { harness } = await ready();
+    const suite = t.sandbox.script;
+    let typechecks = 0;
+    t.sandbox.script = (command, dir) => {
+      if (command === "bun run typecheck" && ++typechecks === 2) return "timeout"; // the initial checks pass; the re-check times out
+      return suite(command, dir);
+    };
+    harness.script = [
+      discovered(),
+      briefed(),
+      implemented(),
+      reviewing(STANDARD),
+      reviewing(),
+      fixing({ "src/f.ts": "export const f = (n: number) => n + 1; // unverified\n" }, [{ id: "S1", decision: "fixed", reason: "changed it" }]),
+    ];
+    await t.app.work();
+    const first = await jobFor(1);
+    expect(first).toMatchObject({ state: "failed", attempts: [{ result: "checks: timeout" }] });
+    expect(first.attempts[0].commits).toHaveLength(2); // the implement commit and the unverified fix
+
+    await retry(first.id);
+    t.sandbox.script = suite;
+    harness.script = [reviewing(STANDARD), reviewing(), fixing({ "src/f.ts": "export const f = (n: number) => n + 1; // verified\n" }, [{ id: "S1", decision: "fixed", reason: "again" }]), reviewing(), reviewing()];
+    await t.app.work();
+
+    const job = await jobFor(1);
+    expect(job.state).toBe("pr_created");
+    const [a1, a2] = job.attempts;
+    expect(reused(a2)).toEqual(["brief", "implement", "red/green", "checks"]); // no fix phase and no round is reused
+    expect(a2.commits[0]!.sha).toBe(a1.commits[0].sha);
+    expect(a2.commits).toHaveLength(2); // implement plus the newly verified fix
+    expect(a2.commits[1]!.sha).not.toBe(a1.commits[1].sha);
+  });
+
+  test("Retry after a publish failure resumes at publish: no harness run, the same head is pushed", async () => {
+    const { harness, remote } = await ready();
+    t.github.beforePush = () => {
+      throw new Error("GitHub 502");
+    };
+    harness.script = [discovered(), ...solved()];
+    await t.app.work();
+    const first = await jobFor(1);
+    expect(first).toMatchObject({ state: "failed", resume_phase: "publish", attempts: [{ result: "publish: GitHub 502" }] });
+    const head = first.attempts[0].commits[0].sha;
+
+    await retry(first.id);
+    const before = harness.runs.length;
+    t.github.beforePush = undefined;
+    await t.app.work();
+
+    const job = await jobFor(1);
+    expect(job.state).toBe("pr_created");
+    expect(harness.runs).toHaveLength(before); // the publish resume runs no agent session
+    expect(reused(job.attempts[1])).toEqual(["brief", "implement", "red/green", "checks", "review/standards", "review/spec"]);
+    expect(await remoteSha(remote, "agent/issue-1")).toBe(head);
+    expect(t.github.pulls).toHaveLength(1);
+  });
+
+  test("a restart mid-attempt still resumes from the saved bundle after the workspace is wiped", async () => {
+    const { harness } = await ready();
+    harness.script = [discovered(), briefed(), implemented(), () => new Promise(() => {})]; // blocked in review/standards
+    void t.app.work();
+    await until(() => harness.runs.length === 4);
+    t.restart();
+    await t.app.start(); // wipes every workspace
+    const first = await jobFor(1);
+    expect(first.attempts[0].result).toBe("Interrupted by a restart");
+    const head = first.attempts[0].commits[0].sha;
+    expect(existsSync(harness.runs[0]!.workspace)).toBe(false);
+
+    await retry(first.id);
+    harness.script = [reviewed(), reviewed()];
+    await t.app.work();
+
+    const job = await jobFor(1);
+    expect(job.state).toBe("pr_created");
+    expect(job.attempts[1].commits[0].sha).toBe(head); // the bundle restored the commit with its SHA
+  });
+
+  test("a resumed attempt uses the saved base and commits even after the default branch moved", async () => {
+    const { harness, remote } = await ready();
+    const suite = t.sandbox.script;
+    t.sandbox.script = (command, dir) => (command === "bun run typecheck" ? "timeout" : suite(command, dir));
+    harness.script = [discovered(), briefed(), implemented()];
+    await t.app.work();
+    const first = await jobFor(1);
+    expect(first.attempts[0].result).toBe("checks: timeout");
+    const base = first.attempts[0].base_sha;
+    const head = first.attempts[0].commits[0].sha;
+
+    await commit(remote, { "extra.txt": "the default branch moved on\n" });
+    const moved = await remoteSha(remote, "main");
+    expect(moved).not.toBe(base);
+
+    await retry(first.id);
+    t.sandbox.script = suite;
+    harness.script = [reviewed(), reviewed()];
+    await t.app.work();
+
+    const job = await jobFor(1);
+    expect(job.state).toBe("pr_created");
+    expect(job.attempts[1].base_sha).toBe(base);
+    expect(job.attempts[1].commits[0].sha).toBe(head);
+    expect(await remoteSha(remote, "main")).toBe(moved); // the default branch is never written
+    expect(await remoteSha(remote, "agent/issue-1")).toBe(head);
+  });
+
+  test("Retry is refused with 409 unless the job is failed or needs_info, and 404 for an unknown job", async () => {
+    const { harness } = await ready([issue(1), issue(2, { authorAssociation: "NONE" })]);
+    const id = async (number: number) => (await jobFor(number)).id;
+    expect((await t.post(`/api/jobs/${await id(1)}/retry`)).status).toBe(409); // queued
+    expect((await t.post(`/api/jobs/${await id(2)}/retry`)).status).toBe(409); // skipped: untrusted author
+
+    let release!: () => void;
+    harness.script = [() => new Promise((resolve) => (release = () => resolve(discovered()()))), ...solved()];
+    const working = t.app.work();
+    await until(() => harness.runs.length === 1);
+    expect((await jobFor(1)).state).toBe("running");
+    expect((await t.post(`/api/jobs/${await id(1)}/retry`)).status).toBe(409);
+    release();
+    await working;
+
+    expect((await jobFor(1)).state).toBe("pr_created");
+    const res = await t.post(`/api/jobs/${await id(1)}/retry`); // pr_created
+    expect(res.status).toBe(409);
+    const { error } = await res.json();
+    expect(error).toContain("needs_info");
+    expect(error).toContain("failed");
+    expect((await t.post("/api/jobs/99/retry")).status).toBe(404);
+  });
+
+  test("a failed job is queued once: a second Retry is refused", async () => {
+    const { harness } = await ready();
+    harness.script = [discovered(), briefed(), () => ({ ok: false, error: "timeout", log: "x" })];
+    await t.app.work();
+    const { id } = await jobFor(1);
+    await retry(id);
+    expect((await t.post(`/api/jobs/${id}/retry`)).status).toBe(409);
+    expect((await jobFor(1)).state).toBe("queued");
   });
 });

@@ -1,5 +1,5 @@
 import { $ } from "bun";
-import { readFileSync, readlinkSync } from "node:fs";
+import { readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { JsonSchema } from "./harness";
 import type { Brief, Commit, Conventions } from "./jobs";
@@ -128,4 +128,33 @@ export async function commitChange(workspace: string, message: string): Promise<
   const sha = (await $`git -C ${workspace} rev-parse HEAD`.text()).trim();
   const stat = (await $`git -C ${workspace} show --stat --format= ${sha}`.text()).trim();
   return { sha, message, stat };
+}
+
+/**
+ * A git bundle of base..HEAD, so a resumed attempt can restore the commits into a fresh checkout with their
+ * original SHAs. Written after every commit, so an attempt cut off by a restart can still resume.
+ */
+export async function bundleChange(workspace: string, base: string): Promise<Uint8Array> {
+  const file = join(workspace, ".git/auto-solve.bundle");
+  try {
+    await $`git -C ${workspace} bundle create -q ${file} ${base}..HEAD`.quiet();
+    return new Uint8Array(readFileSync(file));
+  } finally {
+    rmSync(file, { force: true });
+  }
+}
+
+/**
+ * Fetches a saved bundle's commits into a fresh checkout and resets HEAD to head, the last commit it holds. The
+ * bundle is thin against base, which the fresh clone still has whether or not the default branch moved.
+ */
+export async function restoreBundle(workspace: string, bundle: Uint8Array, head: string) {
+  const file = join(workspace, ".git/auto-solve.bundle");
+  writeFileSync(file, bundle);
+  try {
+    await $`git -C ${workspace} fetch -q ${file} ${head}:refs/auto-solve/resume`.quiet();
+    await $`git -C ${workspace} reset -q --hard ${head}`.quiet();
+  } finally {
+    rmSync(file, { force: true });
+  }
 }

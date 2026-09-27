@@ -153,6 +153,9 @@ function renderAttempt(attempt: JobDetail["attempts"][number], number: number) {
     `Attempt ${number} (${attempt.harness})`,
     el("p", { class: "text-sm text-slate-600" }, "Started ", time(attempt.started_at), ...(attempt.finished_at ? [", finished ", time(attempt.finished_at)] : [])),
     el("p", { class: "my-2 break-words", textContent: attempt.result ?? "Running…" }),
+    ...(attempt.resumed_from === null
+      ? []
+      : [el("p", { class: "my-2 break-words", textContent: `Resumed from attempt ${attempt.resumed_from} at ${attempt.phases.find((p) => p.outcome !== "reused")?.name ?? "publish"}.` })]),
     ...[
       ["Pull request", attempt.pr_url],
       ["Branch", attempt.branch_url],
@@ -204,7 +207,9 @@ function renderJob(content: HTMLElement, job: JobDetail) {
       ? jobAction(job, "run-anyway", "Run anyway", "Read the issue first: its author is not you or a collaborator.")
       : job.state === "needs_info"
         ? jobAction(job, "retry", "Retry", "Answer the questions by editing the issue, then retry: the brief starts over from the edited issue.")
-        : null;
+        : job.state === "failed"
+          ? jobAction(job, "retry", "Retry", `Retry resumes at the ${job.resume_phase ?? "failed"} phase with the saved commits.`)
+          : null;
   const row = (label: string, value: Child) =>
     el("div", { class: "grid gap-1 py-2 sm:grid-cols-[10rem_1fr]" }, el("dt", { class: "text-slate-500", textContent: label }), el("dd", { class: "break-words" }, value));
   content.replaceChildren(

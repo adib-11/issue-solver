@@ -18,12 +18,18 @@ export type Job = {
   phase: string | null;
   /** Why the job was skipped; null unless state is "skipped". */
   skip_reason: string | null;
+  /** The attempt the next attempt resumes from, set by a Retry of a failed job; null otherwise. */
+  resume_from: number | null;
   created_at: string;
   updated_at: string;
 };
 
 /** GET /api/jobs/:id: the job with every attempt, oldest first. */
-export type JobDetail = Job & { attempts: Attempt[] };
+export type JobDetail = Job & {
+  attempts: Attempt[];
+  /** The phase a Retry of a failed job would resume at; null unless state is "failed". */
+  resume_phase: string | null;
+};
 
 export type Attempt = {
   id: number;
@@ -42,6 +48,8 @@ export type Attempt = {
   branch_url: string | null;
   /** The draft PR, opened or reused; null until it exists. */
   pr_url: string | null;
+  /** The attempt this one continued, when a Retry resumed one; null for a fresh attempt. */
+  resumed_from: number | null;
   phases: Phase[];
 };
 
