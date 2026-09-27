@@ -266,7 +266,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     setPhase.run("publish", now(), job.id);
     const phase = startPhase.get(attemptId, "publish", now())!;
     const log: string[] = [];
-    const end = (outcome: string, output: object | null = null) => endPhase.run(now(), outcome, redact(log.join("\n")), output && JSON.stringify(output), phase.id);
+    const end = (outcome: string, output: object | null = null) => endPhase.run(now(), outcome, capLog(redact(log.join("\n"))), output && JSON.stringify(output), phase.id);
     try {
       if ((await github.getIssue(installation, fullName, job.issue_number)).state === "CLOSED") {
         end("skipped");

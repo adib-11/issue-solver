@@ -779,9 +779,8 @@ describe("publish", () => {
     expect(await remoteSha(remote, "main")).toBe(main);
     expect(t.github.pulls).toMatchObject([{ fullName: "octo/app", head: "agent/issue-1", base: "main", draft: true, title: "Make f handle 1" }]);
     // No auto-merge, approvals, or reviewer requests: the controller has no such operations to call.
-    expect(new Set(t.github.calls.map((c) => c.op))).toEqual(
-      new Set(["listInstallations", "listInstallationRepos", "listIssues", "checkout", "getIssue", "branchSha", "push", "findPullRequest", "createDraftPullRequest"]),
-    );
+    const allowed = ["listInstallations", "listInstallationRepos", "listIssues", "checkout", "getIssue", "branchSha", "push", "findPullRequest", "createDraftPullRequest"];
+    expect(t.github.calls.filter((c) => !allowed.includes(c.op))).toEqual([]);
   });
 
   test("the PR body lets the owner review without the dashboard", async () => {

@@ -7,7 +7,7 @@ export const branchFor = (issueNumber: number) => `agent/issue-${issueNumber}`;
 export const prTitle = (issue: IssueSnapshot, conventions: Conventions, commitMessage: string) =>
   conventions.commit_style.trim() ? commitMessage.split("\n")[0]!.trim() : `Fix #${issue.number}: ${issue.title}`;
 
-const runs = ({ runs, skipped }: CommandRuns, withBase: boolean) =>
+const commandList = ({ runs, skipped }: CommandRuns, withBase: boolean) =>
   skipped
     ? `Skipped: ${skipped}.`
     : runs
@@ -44,11 +44,11 @@ ${tests}
 
 ## Red/green
 
-${runs(p.redGreen, true)}
+${commandList(p.redGreen, true)}
 
 ## Checks
 
-${runs(p.checks, false)}
+${commandList(p.checks, false)}
 
 ---
 

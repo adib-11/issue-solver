@@ -97,7 +97,7 @@ export function createGitHubClient(appId: string, privateKey: string): GitHub {
   }
 
   /** Runs git with the installation token as a header from the environment, so it is neither on the command line nor written to .git/config. */
-  async function git(installationId: number, args: string[]) {
+  async function git(installationId: number, what: string, args: string[]) {
     const token = await installationToken(installationId);
     const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
     const env = {
@@ -108,7 +108,8 @@ export function createGitHubClient(appId: string, privateKey: string): GitHub {
       GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
     };
     const result = await $`git -c core.hooksPath=/dev/null ${args}`.env(env).nothrow().quiet();
-    if (result.exitCode !== 0) throw new Error(`git ${args[0]} failed: ${result.stderr.toString().replaceAll(token, "[redacted]")}`);
+    const stderr = result.stderr.toString().replaceAll(token, "[redacted]").replaceAll(basic, "[redacted]");
+    if (result.exitCode !== 0) throw new Error(`${what} failed: ${stderr}`);
     return result.stdout.toString();
   }
 
@@ -151,7 +152,7 @@ export function createGitHubClient(appId: string, privateKey: string): GitHub {
     },
 
     async checkout(installationId, fullName, dir) {
-      await git(installationId, ["clone", "-q", `https://github.com/${fullName}.git`, dir]);
+      await git(installationId, `git clone of ${fullName}`, ["clone", "-q", `https://github.com/${fullName}.git`, dir]);
     },
 
     async getIssue(installationId, fullName, number) {
@@ -174,12 +175,12 @@ export function createGitHubClient(appId: string, privateKey: string): GitHub {
     },
 
     async branchSha(installationId, fullName, branch) {
-      const out = await git(installationId, ["ls-remote", `https://github.com/${fullName}.git`, `refs/heads/${branch}`]);
+      const out = await git(installationId, `git ls-remote of ${fullName}`, ["ls-remote", `https://github.com/${fullName}.git`, `refs/heads/${branch}`]);
       return out.split("\t")[0]!.trim() || null;
     },
 
     async push(installationId, fullName, dir, sha, branch) {
-      await git(installationId, ["-C", dir, "push", "-q", `https://github.com/${fullName}.git`, `${sha}:refs/heads/${branch}`]);
+      await git(installationId, `git push to ${fullName} ${branch}`, ["-C", dir, "push", "-q", `https://github.com/${fullName}.git`, `${sha}:refs/heads/${branch}`]);
     },
 
     async findPullRequest(installationId, fullName, branch) {
