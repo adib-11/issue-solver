@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config";
@@ -61,3 +61,46 @@ test("publicUrl and webhookSecret are optional and trimmed", () => {
     webhookSecret: "whsec_123",
   });
 });
+
+test("port and commentQuestions have defaults and parse values", () => {
+  expect(loadConfig(full)).toMatchObject({ port: 3000, commentQuestions: false });
+  expect(loadConfig({ ...full, PORT: "8080", COMMENT_QUESTIONS: "true" })).toMatchObject({
+    port: 8080,
+    commentQuestions: true,
+  });
+});
+
+test(".env.example lists every required and optional setting with comments", () => {
+  const envExamplePath = join(import.meta.dir, "../../.env.example");
+  const content = readFileSync(envExamplePath, "utf8");
+  const lines = content.split("\n");
+
+  const expectedKeys = [
+    "OWNER_LOGIN",
+    "GITHUB_APP_ID",
+    "GITHUB_APP_PRIVATE_KEY_PATH",
+    "ADMIN_PASSWORD",
+    "PORT",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "COMMENT_QUESTIONS",
+    "DOCKER_GID",
+    "PUBLIC_URL",
+    "WEBHOOK_SECRET",
+  ];
+
+  for (const key of expectedKeys) {
+    const keyIndex = lines.findIndex((line) => line.startsWith(`${key}=`));
+    expect(keyIndex).toBeGreaterThan(-1);
+    // Comment block preceding the key must explicitly note whether it is required or optional
+    const commentBlock: string[] = [];
+    let idx = keyIndex - 1;
+    while (idx >= 0 && lines[idx]?.trim().startsWith("#")) {
+      commentBlock.unshift(lines[idx]!);
+      idx--;
+    }
+    expect(commentBlock.length).toBeGreaterThan(0);
+    const fullComment = commentBlock.join(" ");
+    expect(fullComment.toLowerCase()).toMatch(/required|optional/);
+  }
+});
+
