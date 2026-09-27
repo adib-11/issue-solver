@@ -90,8 +90,9 @@ export function createGitHubClient(appId: string, privateKey: string, options: G
         const seconds = parseFloat(retryAfter);
         if (!isNaN(seconds)) delay = Math.max(delay, seconds * 1000);
       }
+      const remaining = res.headers.get("x-ratelimit-remaining");
       const reset = res.headers.get("x-ratelimit-reset");
-      if (reset) {
+      if (remaining === "0" && reset) {
         const resetSec = parseFloat(reset);
         if (!isNaN(resetSec)) {
           const diffMs = resetSec * 1000 - nowFn();
@@ -133,9 +134,7 @@ export function createGitHubClient(appId: string, privateKey: string, options: G
 
       const isRateLimit403 =
         res.status === 403 &&
-        (res.headers.get("x-ratelimit-remaining") === "0" ||
-          res.headers.has("retry-after") ||
-          res.headers.has("x-ratelimit-reset"));
+        (res.headers.get("x-ratelimit-remaining") === "0" || res.headers.has("retry-after"));
       const isTransient = (res.status >= 500 && res.status <= 599) || res.status === 429 || isRateLimit403;
 
       if (!isTransient || attempt >= 3) {

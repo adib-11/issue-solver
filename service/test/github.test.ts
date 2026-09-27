@@ -213,3 +213,34 @@ test("retries on network fetch errors", async () => {
   expect(attempts).toBe(2);
   expect(sleeps).toEqual([1000]);
 });
+
+test("throws immediately on 403 without rate limit indicators (permission denied)", async () => {
+  const sleeps: number[] = [];
+  let attempts = 0;
+
+  const fakeFetch = async (url: string | URL | Request) => {
+    const urlStr = url.toString();
+    if (urlStr.includes("access_tokens")) {
+      return new Response(JSON.stringify({ token: "tok-1", expires_at: new Date(Date.now() + 3600_000).toISOString() }), { status: 200 });
+    }
+    attempts++;
+    return new Response("Forbidden", {
+      status: 403,
+      headers: {
+        "x-ratelimit-remaining": "4999",
+        "x-ratelimit-reset": "1700003600",
+      },
+    });
+  };
+
+  const client = createGitHubClient("app-123", privateKey, {
+    fetch: fakeFetch as any,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+  });
+
+  await expect(client.getIssue(10, "octo/app", 1)).rejects.toThrow("GitHub GET /repos/octo/app/issues/1 -> 403");
+  expect(attempts).toBe(1);
+  expect(sleeps).toHaveLength(0);
+});
