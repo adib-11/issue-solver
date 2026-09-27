@@ -33,16 +33,13 @@ const IMPLEMENTED = {
   commit_message: "Make f handle 1",
 };
 const CHANGE = { "src/f.ts": "export const f = (n: number) => n + 1;\n", "test/f.test.ts": "test('f(1) returns 2', () => {});\n" };
-/** The implement phase: writes files into the workspace (null deletes one), then reports output. */
+/** The implement phase: writes files into the workspace, then reports output. */
 const implemented =
-  (files: Record<string, string | null> = CHANGE, output: unknown = IMPLEMENTED): ((options: RunOptions) => RunResult) =>
+  (files: Record<string, string> = CHANGE, output: unknown = IMPLEMENTED): ((options: RunOptions) => RunResult) =>
   ({ workspace }) => {
     for (const [path, content] of Object.entries(files)) {
-      if (content === null) rmSync(join(workspace, path));
-      else {
-        mkdirSync(dirname(join(workspace, path)), { recursive: true });
-        writeFileSync(join(workspace, path), content);
-      }
+      mkdirSync(dirname(join(workspace, path)), { recursive: true });
+      writeFileSync(join(workspace, path), content);
     }
     return { ok: true, output, log: "implement log" };
   };
@@ -500,7 +497,7 @@ describe("implement", () => {
     expect(commits).toMatchObject([{ message: "Make f handle 1", stat: expect.stringContaining("2 files changed") }]);
   });
 
-  const rejected: Record<string, { files?: Record<string, string | null>; output?: unknown; conventions?: object; reason: RegExp; setup?: (workspace: string) => void }> = {
+  const rejected: Record<string, { files?: Record<string, string>; output?: unknown; conventions?: object; reason: RegExp; setup?: (workspace: string) => void }> = {
     "an empty diff": { files: {}, reason: /empty/ },
     "an edit under .github/workflows/": { files: { ...CHANGE, ".github/workflows/ci.yml": "on: push" }, reason: /\.github\/workflows\/ci\.yml/ },
     "a symlink out of the checkout": { reason: /outside the checkout: link\.txt/, setup: (ws) => symlinkSync("../../etc/passwd", join(ws, "link.txt")) },
@@ -508,6 +505,12 @@ describe("implement", () => {
     "a symlink into .git": { reason: /outside the checkout: hooks$/, setup: (ws) => symlinkSync(".git/hooks", join(ws, "hooks")) },
     "a diff with no test-file change in a repo with tests": { files: { "src/f.ts": "x" }, output: { ...IMPLEMENTED, tests_added: [] }, reason: /no test/ },
     "a reported test file the diff does not change": { files: { "src/f.ts": "x" }, reason: /test\/f\.test\.ts/ },
+    "a reported test file the diff only deletes": {
+      files: { "src/f.ts": "x" },
+      output: { ...IMPLEMENTED, tests_added: [{ file: "README.md", name: "gone" }] },
+      reason: /README\.md/,
+      setup: (ws) => rmSync(join(ws, "README.md")),
+    },
     "tests added to a repo without tests": { conventions: { ...CONVENTIONS, has_tests: false, test_file_command: "" }, reason: /has no tests/ },
     "an edit to the checkout's git config": { reason: /\.git\/config/, setup: (ws) => writeFileSync(join(ws, ".git/config"), "[core]\n\tfsmonitor = touch /tmp/pwned\n", { flag: "a" }) },
   };

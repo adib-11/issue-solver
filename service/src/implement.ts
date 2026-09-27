@@ -97,9 +97,10 @@ export async function changeError(workspace: string, head: string, configHash: s
   }
   if (!hasTests) return testFiles.length ? "the repo has no tests, but the agent reports adding some" : null;
   if (!testFiles.length) return "the repo has tests, but the diff adds no test";
-  const paths = new Set(changed.map((c) => c.path));
+  // A deleted file is not a test added.
+  const paths = new Set(changed.filter((c) => c.mode !== "000000").map((c) => c.path));
   const missing = testFiles.find((f) => !paths.has(f));
-  return missing ? `the reported test file ${missing} is not in the diff` : null;
+  return missing ? `the reported test file ${missing} is not added or changed by the diff` : null;
 }
 
 /** Commits the staged change as the controller and describes the commit. */
