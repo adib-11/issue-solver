@@ -5,11 +5,12 @@ import { Hono } from "hono";
 import { basicAuth } from "hono/basic-auth";
 import type { Clock } from "./clock";
 import type { Config } from "./config";
+import { BRIEF_SCHEMA, BRIEF_TIMEOUT_MS, briefError, briefPrompt, questionsComment } from "./brief";
 import { CONVENTIONS_PROMPT, CONVENTIONS_SCHEMA, CONVENTIONS_TIMEOUT_MS, conventionsHash } from "./conventions";
 import { openDb } from "./db";
 import type { GitHub, Issue, Repo } from "./github";
 import { type AuthCheckState, type Harness, type RunError, type RunOptions, schemaError, type SetupView } from "./harness";
-import { type Attempt, type Conventions, JOB_STATES, type Job, type JobDetail, NO_CHECKS, type Phase, type RepoView, UNTRUSTED_AUTHOR } from "./jobs";
+import { type Attempt, type Brief, type Conventions, JOB_STATES, type IssueSnapshot, type Job, type JobDetail, NO_CHECKS, type Phase, type RepoView, UNTRUSTED_AUTHOR } from "./jobs";
 import type { Runner } from "./runner";
 
 const PAGE_SIZE = 50;
@@ -31,7 +32,7 @@ type RepoRow = {
 };
 
 const LOG_LIMIT_BYTES = 200 * 1024;
-const PIPELINE_ENDS = "Pipeline ends here: the phases after conventions are not built yet.";
+const PIPELINE_ENDS = "Pipeline ends here: the phases after brief are not built yet.";
 const INTERRUPTED = "Interrupted by a restart";
 // GitHub tokens and Claude tokens, wherever they come from; configured harness credentials are redacted by value too.
 const SECRET_PATTERNS = [/\bgh[pousr]_[A-Za-z0-9]{20,}/g, /\bgithub_pat_[A-Za-z0-9_]{20,}/g, /\bsk-ant-[A-Za-z0-9_-]+/g];
@@ -176,13 +177,14 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     "INSERT INTO attempts (job_id, harness, started_at) VALUES (?, ?, ?) RETURNING id",
   );
   const setBaseSha = db.query("UPDATE attempts SET base_sha = ? WHERE id = ?");
+  const setIssue = db.query("UPDATE attempts SET issue = ? WHERE id = ?");
   const endAttempt = db.query("UPDATE attempts SET finished_at = ?, result = ? WHERE id = ?");
   const endJob = db.query("UPDATE jobs SET state = ?, skip_reason = ?, phase = NULL, updated_at = ? WHERE id = ?");
   const setPhase = db.query("UPDATE jobs SET phase = ?, updated_at = ? WHERE id = ?");
   const startPhase = db.query<{ id: number }, [number, string, string]>(
     "INSERT INTO phases (attempt_id, name, started_at) VALUES (?, ?, ?) RETURNING id",
   );
-  const endPhase = db.query("UPDATE phases SET finished_at = ?, outcome = ?, log = ? WHERE id = ?");
+  const endPhase = db.query("UPDATE phases SET finished_at = ?, outcome = ?, log = ?, output = ? WHERE id = ?");
   const getRepo = db.query<RepoRow, [number]>("SELECT * FROM repos WHERE id = ?");
   const saveConventions = db.query("UPDATE repos SET conventions = ?, conventions_hash = ?, conventions_at = ? WHERE id = ?");
   const parse = <T>(json: string | null): T | null => (json === null ? null : JSON.parse(json));
@@ -208,11 +210,20 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     })();
   }
 
-  async function runPhase({ job, attemptId, harness, workspace }: Claimed, name: string, options: Omit<RunOptions, "workspace" | "wrap">) {
+  /** Runs one agent phase; check rejects schema-valid output as bad_output with its reason. */
+  async function runPhase(
+    { job, attemptId, harness, workspace }: Claimed,
+    name: string,
+    options: Omit<RunOptions, "workspace" | "wrap">,
+    check: (output: unknown) => string | null = () => null,
+  ) {
     setPhase.run(name, now(), job.id);
     const phase = startPhase.get(attemptId, name, now())!;
-    const result = await harness.run({ ...options, workspace, wrap: runner.command(workspace) });
-    endPhase.run(now(), result.ok ? "ok" : result.error, capLog(redact(result.log)), phase.id);
+    let result = await harness.run({ ...options, workspace, wrap: runner.command(workspace) });
+    const invalid = result.ok && check(result.output);
+    if (invalid) result = { ok: false, error: "bad_output", log: `${result.log}\nOutput rejected: ${invalid}` };
+    const output = result.ok ? JSON.stringify(result.output) : null;
+    endPhase.run(now(), result.ok ? "ok" : result.error, capLog(redact(result.log)), output, phase.id);
     return result;
   }
 
@@ -235,6 +246,12 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     await $`git -C ${workspace} config core.hooksPath /dev/null`;
     setBaseSha.run((await $`git -C ${workspace} rev-parse HEAD`.text()).trim(), attemptId);
 
+    // A fresh snapshot every attempt: Retry after editing the issue briefs the edited text.
+    const fetched = await github.getIssue(repo.installation_id, repo.full_name, job.issue_number);
+    if (fetched.state === "CLOSED") return finish(claimed, "skipped", "skipped: closed", "closed");
+    const issue: IssueSnapshot = { ...fetched, comments: fetched.comments.filter((c) => TRUSTED_AUTHORS.includes(c.authorAssociation)) };
+    setIssue.run(JSON.stringify(issue), attemptId);
+
     let conventions = parse<Conventions>(repo.override);
     const hash = conventions ? null : await conventionsHash(workspace);
     if (hash && repo.conventions_hash === hash) conventions = parse<Conventions>(repo.conventions);
@@ -245,6 +262,22 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
       saveConventions.run(JSON.stringify(conventions), hash, now(), repo.id);
     }
     if (!conventions.check_commands.length) return finish(claimed, "skipped", `skipped: ${NO_CHECKS}`, NO_CHECKS);
+
+    const briefed = await runPhase(claimed, "brief", { prompt: briefPrompt(issue, conventions), schema: BRIEF_SCHEMA, timeoutMs: BRIEF_TIMEOUT_MS }, briefError);
+    if (!briefed.ok) return harnessFailed(claimed, "brief", briefed.error);
+    const brief = briefed.output as Brief;
+    if (brief.outcome === "needs_info") {
+      let result = "needs_info: the issue is too vague for testable acceptance criteria";
+      if (config.commentQuestions) {
+        try {
+          await github.comment(repo.installation_id, repo.full_name, job.issue_number, questionsComment(brief.questions));
+          result += "; the questions are posted on the issue";
+        } catch (err) {
+          result += `; posting the questions failed: ${redact((err as Error).message)}`;
+        }
+      }
+      return finish(claimed, "needs_info", result);
+    }
     finish(claimed, "failed", PIPELINE_ENDS);
   }
 
@@ -308,15 +341,31 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     return c.json({ jobs, page, pageSize: PAGE_SIZE, total });
   });
 
-  const listAttempts = db.query<Omit<Attempt, "phases">, [number]>(
-    "SELECT id, harness, base_sha, started_at, finished_at, result FROM attempts WHERE job_id = ? ORDER BY id",
+  type Stored<T, K extends keyof T> = Omit<T, K> & { [P in K]: string | null };
+  const listAttempts = db.query<Stored<Omit<Attempt, "phases">, "issue">, [number]>(
+    "SELECT id, harness, base_sha, started_at, finished_at, result, issue FROM attempts WHERE job_id = ? ORDER BY id",
   );
-  const listPhases = db.query<Phase, [number]>("SELECT name, started_at, finished_at, outcome, log FROM phases WHERE attempt_id = ? ORDER BY id");
+  const listPhases = db.query<Stored<Phase, "output">, [number]>(
+    "SELECT name, started_at, finished_at, outcome, log, output FROM phases WHERE attempt_id = ? ORDER BY id",
+  );
   http.get("/api/jobs/:id", (c) => {
     const job = getJob.get(Number(c.req.param("id")));
     if (!job) return c.json({ error: "Job not found" }, 404);
-    const attempts = listAttempts.all(job.id).map((a) => ({ ...a, phases: listPhases.all(a.id) }));
+    const attempts = listAttempts.all(job.id).map((a) => ({
+      ...a,
+      issue: parse<IssueSnapshot>(a.issue),
+      phases: listPhases.all(a.id).map((p) => ({ ...p, output: parse(p.output) })),
+    }));
     return c.json({ ...job, attempts } satisfies JobDetail);
+  });
+
+  // ponytail: needs_info only; failed jobs become retryable when phases can resume.
+  const retry = db.query("UPDATE jobs SET state = 'queued', updated_at = ? WHERE id = ? AND state = 'needs_info'");
+  http.post("/api/jobs/:id/retry", (c) => {
+    const id = Number(c.req.param("id"));
+    if (retry.run(now(), id).changes) return c.json(getJob.get(id), 202);
+    if (!getJob.get(id)) return c.json({ error: "Job not found" }, 404);
+    return c.json({ error: "Only needs_info jobs can be retried" }, 409);
   });
 
   const listRepos = db.query<RepoRow, []>("SELECT * FROM repos ORDER BY full_name");

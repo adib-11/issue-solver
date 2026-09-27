@@ -31,7 +31,32 @@ export type Attempt = {
   finished_at: string | null;
   /** How the attempt ended; null while it runs. */
   result: string | null;
+  /** The issue as the brief phase saw it; null until the attempt takes it. */
+  issue: IssueSnapshot | null;
   phases: Phase[];
+};
+
+export type IssueComment = { author: string; authorAssociation: string; body: string };
+
+/** An issue at one moment. Only comments by trusted authors are kept, since the agent reads them. */
+export type IssueSnapshot = {
+  number: number;
+  title: string;
+  url: string;
+  state: "OPEN" | "CLOSED";
+  body: string;
+  comments: IssueComment[];
+};
+
+/** The brief phase's output: a brief with criteria and seams, or questions; never both. */
+export type Brief = {
+  outcome: "brief" | "needs_info";
+  /** Markdown in the agent-brief template; "" for needs_info. */
+  brief: string;
+  acceptance_criteria: string[];
+  /** The public boundaries the new tests will exercise. */
+  seams: string[];
+  questions: string[];
 };
 
 export type Phase = {
@@ -42,6 +67,8 @@ export type Phase = {
   outcome: string | null;
   /** Redacted, and only the last 200 KiB. */
   log: string;
+  /** The validated output; null while running or when the phase failed. */
+  output: unknown;
 };
 
 /** How to build and verify changes to a repo. An empty string means "none". */

@@ -1,6 +1,8 @@
 services:
   controller:
-    build: ./service
+    build:
+      context: .
+      dockerfile: service/Dockerfile
     restart: unless-stopped
     ports:
       - "127.0.0.1:${PORT:-3000}:3000"
@@ -10,6 +12,7 @@ services:
       GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/github_app_key
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      COMMENT_QUESTIONS: ${COMMENT_QUESTIONS:-false}
       RUNNER_IMAGE: auto-solve-runner:local
       WORKSPACE_VOLUME: auto-solve-workspaces
     secrets:

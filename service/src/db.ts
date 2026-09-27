@@ -18,9 +18,12 @@ export function openDb(path: string) {
     updated_at TEXT NOT NULL,
     UNIQUE (repo_id, issue_number)
   )`);
-  // Added after the first release; older databases gain it here.
-  const jobColumns = db.query<{ name: string }, []>("SELECT name FROM pragma_table_info('jobs')").all();
-  if (!jobColumns.some((c) => c.name === "phase")) db.run("ALTER TABLE jobs ADD COLUMN phase TEXT");
+  // Columns added after the first release; older databases gain them here.
+  const addColumn = (table: string, column: string, type: string) => {
+    const columns = db.query<{ name: string }, [string]>("SELECT name FROM pragma_table_info(?)").all(table);
+    if (!columns.some((c) => c.name === column)) db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  };
+  addColumn("jobs", "phase", "TEXT");
   db.run(`CREATE TABLE IF NOT EXISTS repos (
     id INTEGER PRIMARY KEY,
     full_name TEXT NOT NULL,
@@ -48,6 +51,8 @@ export function openDb(path: string) {
     outcome TEXT,
     log TEXT NOT NULL DEFAULT ''
   )`);
+  addColumn("attempts", "issue", "TEXT");
+  addColumn("phases", "output", "TEXT");
   db.run(`CREATE TABLE IF NOT EXISTS scan_cursors (
     repo_id INTEGER PRIMARY KEY,
     scanned_at TEXT NOT NULL

@@ -1,6 +1,6 @@
 // Dashboard. Everything from the API is rendered with textContent only; see scripts/no-html-insertion.sh.
 import type { AuthCheckState, SetupView as Setup } from "../harness";
-import { type Conventions, JOB_STATES, type Job, type JobDetail, type RepoView, UNTRUSTED_AUTHOR } from "../jobs";
+import { type Brief, type Conventions, JOB_STATES, type Job, type JobDetail, type RepoView, UNTRUSTED_AUTHOR } from "../jobs";
 
 type JobPage = { jobs: Job[]; page: number; pageSize: number; total: number };
 
@@ -114,11 +114,21 @@ function renderList(content: HTMLElement, data: JobPage) {
   );
 }
 
+const list = (title: string, items: string[]) =>
+  el("div", { class: "mt-2" }, el("h4", { class: "font-medium", textContent: title }), el("ul", { class: "list-disc pl-5" }, ...items.map((text) => el("li", { class: "break-words", textContent: text }))));
+
+function renderBrief(brief: Brief) {
+  if (brief.outcome === "needs_info") return list("Questions for the issue author", brief.questions);
+  return el("div", {}, pre(brief.brief), list("Acceptance criteria", brief.acceptance_criteria), list("Seams", brief.seams));
+}
+
 function renderAttempt(attempt: JobDetail["attempts"][number], number: number) {
+  const brief = attempt.phases.find((p) => p.name === "brief" && p.output)?.output as Brief | undefined;
   return section(
     `Attempt ${number} (${attempt.harness})`,
     el("p", { class: "text-sm text-slate-600" }, "Started ", time(attempt.started_at), ...(attempt.finished_at ? [", finished ", time(attempt.finished_at)] : [])),
     el("p", { class: "my-2 break-words", textContent: attempt.result ?? "Running…" }),
+    brief ? el("div", { class: "border-t border-slate-200 py-2" }, renderBrief(brief)) : null,
     ...attempt.phases.map((phase) =>
       el(
         "details",
@@ -130,33 +140,29 @@ function renderAttempt(attempt: JobDetail["attempts"][number], number: number) {
   );
 }
 
+/** A job action button with its hint; stays disabled once the action succeeds, until the job re-renders. */
+function jobAction(job: JobDetail, id: string, label: string, hint: string) {
+  const control = button(id, label);
+  const status = el("span", { role: "status", class: "text-sm text-red-800" });
+  control.addEventListener("click", async () => {
+    control.disabled = true;
+    const res = await fetch(`/api/jobs/${job.id}/${id}`, { method: "POST" }).catch(() => null);
+    if (!res?.ok) {
+      control.disabled = false;
+      status.textContent = `${label} failed (${res ? res.status : "network error"}).`;
+    }
+    refresh();
+  });
+  return el("div", { class: "mt-3 flex flex-wrap items-center gap-2" }, el("span", { class: "text-sm text-slate-600", textContent: hint }), control, status);
+}
+
 function renderJob(content: HTMLElement, job: JobDetail) {
-  let runAnyway: HTMLElement | null = null;
-  if (job.state === "skipped" && job.skip_reason === UNTRUSTED_AUTHOR) {
-    const button = el("button", {
-      id: "run-anyway",
-      type: "button",
-      class: `rounded border border-slate-300 bg-white px-3 py-1 disabled:opacity-40 ${focusRing}`,
-      textContent: "Run anyway",
-    });
-    const status = el("span", { role: "status", class: "text-sm text-red-800" });
-    button.addEventListener("click", async () => {
-      button.disabled = true;
-      const res = await fetch(`/api/jobs/${job.id}/run-anyway`, { method: "POST" }).catch(() => null);
-      if (!res?.ok) {
-        button.disabled = false;
-        status.textContent = `Run anyway failed (${res ? res.status : "network error"}).`;
-      }
-      refresh();
-    });
-    runAnyway = el(
-      "div",
-      { class: "mt-3 flex flex-wrap items-center gap-2" },
-      el("span", { class: "text-sm text-slate-600", textContent: "Read the issue first: its author is not you or a collaborator." }),
-      button,
-      status,
-    );
-  }
+  const action =
+    job.state === "skipped" && job.skip_reason === UNTRUSTED_AUTHOR
+      ? jobAction(job, "run-anyway", "Run anyway", "Read the issue first: its author is not you or a collaborator.")
+      : job.state === "needs_info"
+        ? jobAction(job, "retry", "Retry", "Answer the questions by editing the issue, then retry: the brief starts over from the edited issue.")
+        : null;
   const row = (label: string, value: Child) =>
     el("div", { class: "grid gap-1 py-2 sm:grid-cols-[10rem_1fr]" }, el("dt", { class: "text-slate-500", textContent: label }), el("dd", { class: "break-words" }, value));
   content.replaceChildren(
@@ -171,7 +177,7 @@ function renderJob(content: HTMLElement, job: JobDetail) {
       row("Created", time(job.created_at)),
       row("Updated", time(job.updated_at)),
     ),
-    ...(runAnyway ? [runAnyway] : []),
+    ...(action ? [action] : []),
     el("div", { class: "mt-3 flex flex-col gap-3" }, ...[...job.attempts].reverse().map((a, i) => renderAttempt(a, job.attempts.length - i))),
   );
 }
