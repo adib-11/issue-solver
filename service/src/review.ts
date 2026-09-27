@@ -146,6 +146,20 @@ ${findings.map((f) => `- ${f.id} (${f.kind}): ${f.rationale}\n  quote: ${f.quote
 ${JSON.stringify(conventions, null, 2)}`;
 }
 
+/**
+ * Only called on schema-valid review output. The two axes' findings share one id space when the fix phase
+ * decides them, so each axis's ids must be unique and carry its prefix; returns why not, or null.
+ */
+export function reviewError(output: unknown, prefix: "S" | "P") {
+  const seen = new Set<string>();
+  for (const { id } of (output as Reviewed).findings) {
+    if (!id.startsWith(prefix)) return `finding id ${id} does not start with ${prefix}`;
+    if (seen.has(id)) return `there are two findings with id ${id}`;
+    seen.add(id);
+  }
+  return null;
+}
+
 /** Only called on schema-valid output. Returns why output is unacceptable, or null. */
 export function fixError(output: unknown, findings: Finding[]) {
   const { decisions, commit_message } = output as Fixed;

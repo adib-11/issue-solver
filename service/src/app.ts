@@ -13,7 +13,7 @@ import type { GitHub, Issue, Repo } from "./github";
 import { branchFor, prBody, prTitle } from "./publish";
 import { type AuthCheckState, type Harness, type RunError, type RunOptions, schemaError, type SetupView } from "./harness";
 import { type Attempt, type Brief, type CommandRuns, type Commit, type Conventions, JOB_STATES, type IssueSnapshot, type Job, type JobDetail, NO_CHECKS, type Phase, type RepoView, type ReviewRound, TRUSTED_AUTHORS, UNTRUSTED_AUTHOR } from "./jobs";
-import { type Change, FIX_SCHEMA, FIX_TIMEOUT_MS, fixError, fixPrompt, REVIEW_ROUNDS, REVIEW_SCHEMA, REVIEW_TIMEOUT_MS, type Fixed, type Reviewed, specPrompt, standardsPrompt } from "./review";
+import { type Change, FIX_SCHEMA, FIX_TIMEOUT_MS, fixError, fixPrompt, REVIEW_ROUNDS, REVIEW_SCHEMA, REVIEW_TIMEOUT_MS, type Fixed, type Reviewed, reviewError, specPrompt, standardsPrompt } from "./review";
 import type { Runner, Sandbox } from "./runner";
 import { checks, redGreen, type Verified } from "./verify";
 
@@ -307,6 +307,9 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     finish(claimed, pause ? "queued" : "failed", `${phase}: ${error}`);
   }
 
+  /** Why the workspace cannot be used for the next git call on the host, or null. */
+  const workspaceError = (workspace: string, configHash: string) => (gitConfigHash(workspace) === configHash ? null : "the agent edited .git/config");
+
   /**
    * The review loop: up to REVIEW_ROUNDS rounds, each a fresh Standards review and a fresh Spec review. The fix
    * phase decides every finding and its commit is re-checked. The loop ends when a round finds nothing or fixes
@@ -314,23 +317,30 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
    */
   async function reviewLoop(
     claimed: Claimed,
-    configHash: string,
-    change: Change,
-    conventions: Conventions,
-    issue: IssueSnapshot,
-    brief: Brief,
-    latestChecks: CommandRuns,
+    review: { configHash: string; change: Change; conventions: Conventions; issue: IssueSnapshot; brief: Brief; checks: CommandRuns; testFiles: string[] },
   ): Promise<{ rounds: ReviewRound[]; head: string; checks: CommandRuns } | null> {
     const { workspace } = claimed;
+    const { configHash, change, conventions, issue, brief, testFiles } = review;
     const rounds: ReviewRound[] = [];
     let head = change.commits[change.commits.length - 1]!.sha;
+    let latestChecks = review.checks;
     while (rounds.length < REVIEW_ROUNDS) {
-      const standards = await runPhase(claimed, "review/standards", { prompt: standardsPrompt(change, conventions), schema: REVIEW_SCHEMA, timeoutMs: REVIEW_TIMEOUT_MS });
+      const standards = await runPhase(
+        claimed,
+        "review/standards",
+        { prompt: standardsPrompt(change, conventions), schema: REVIEW_SCHEMA, timeoutMs: REVIEW_TIMEOUT_MS },
+        (output) => reviewError(output, "S"),
+      );
       if (!standards.ok) {
         harnessFailed(claimed, "review/standards", standards.error);
         return null;
       }
-      const spec = await runPhase(claimed, "review/spec", { prompt: specPrompt(change, brief, issue), schema: REVIEW_SCHEMA, timeoutMs: REVIEW_TIMEOUT_MS });
+      const spec = await runPhase(
+        claimed,
+        "review/spec",
+        { prompt: specPrompt(change, brief, issue), schema: REVIEW_SCHEMA, timeoutMs: REVIEW_TIMEOUT_MS },
+        (output) => reviewError(output, "P"),
+      );
       if (!spec.ok) {
         harnessFailed(claimed, "review/spec", spec.error);
         return null;
@@ -340,6 +350,15 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
       const findings = [...round.standards, ...round.spec];
       if (!findings.length) break; // a clean round ends the loop
       if (rounds.length >= REVIEW_ROUNDS) break; // the cap: these findings stay open
+
+      // Reviews must not edit: discard anything they left, guarded, so only fixes reach the fix commit.
+      const dirty = workspaceError(workspace, configHash);
+      if (dirty) {
+        finish(claimed, "failed", `review: ${dirty}`);
+        return null;
+      }
+      await $`git -C ${workspace} reset -q --hard ${head}`.quiet();
+      await $`git -C ${workspace} clean -qfd`.quiet();
 
       const fixed = await runPhase(
         claimed,
@@ -364,6 +383,12 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
         finish(claimed, "failed", "fix: the phase marked findings fixed but changed nothing");
         return null;
       }
+      // A fix must not weaken the evidence: red/green does not re-run, so an edited or deleted test would stand.
+      const touched = testFiles.find((file) => staged.changed.some((c) => c.path === file && c.status !== "A"));
+      if (touched) {
+        finish(claimed, "failed", `fix: the fix deletes or edits the test file ${touched}`);
+        return null;
+      }
       const fix = await commitChange(workspace, (fixed.output as Fixed).commit_message);
       addCommit.run(JSON.stringify(fix), claimed.attemptId);
       change.commits.push(fix);
@@ -371,6 +396,12 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
       const rechecked = await verifyPhase(claimed, "checks", () => checks(sandbox, workspace, head, conventions));
       if (!rechecked) return null; // failing checks after the loop fail the attempt, with no PR
       latestChecks = rechecked;
+    }
+    // Both exit paths reach here, and publishing runs git on the host: a tampered checkout's config must fail first.
+    const edited = workspaceError(workspace, configHash);
+    if (edited) {
+      finish(claimed, "failed", `review: ${edited}`);
+      return null;
     }
     return { rounds, head, checks: latestChecks };
   }
@@ -445,7 +476,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     if (!redGreenRuns) return;
     const checkRuns = await verifyPhase(claimed, "checks", () => checks(sandbox, workspace, head.sha, conventions));
     if (!checkRuns) return;
-    const review = await reviewLoop(claimed, configHash, { base: baseSha, commits: [head] }, conventions, issue, brief, checkRuns);
+    const review = await reviewLoop(claimed, { configHash, change: { base: baseSha, commits: [head] }, conventions, issue, brief, checks: checkRuns, testFiles });
     if (!review) return;
     const body = prBody({ issue, brief, implemented: implemented.output as Implemented, redGreen: redGreenRuns, checks: review.checks, review: review.rounds, harness: claimed.harness.label });
     await publish(claimed, repo, review.head, prTitle(issue, conventions, commit_message), body);

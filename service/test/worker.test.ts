@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync
 import { dirname, join } from "node:path";
 import { CONVENTIONS_PROMPT } from "../src/conventions";
 import type { RunOptions, RunResult } from "../src/harness";
-import { REVIEW_TIMEOUT_MS } from "../src/review";
+import { FIX_TIMEOUT_MS, REVIEW_TIMEOUT_MS } from "../src/review";
 import type { Decision, Finding } from "../src/jobs";
 import { commit, issue, repo, setup } from "./fakes";
 
@@ -1037,6 +1037,74 @@ describe("review loop", () => {
     expect(t.github.pulls).toHaveLength(0);
   });
 
+  const tamper = (options: RunOptions) => writeFileSync(join(options.workspace, ".git/config"), "[core]\n\tfsmonitor = touch pwned\n", { flag: "a" });
+
+  test("a review session that edits the checkout's git config fails the attempt before publish", async () => {
+    const { harness } = await ready();
+    harness.script = [discovered(), briefed(), implemented(), (options) => (tamper(options), reviewed()()), reviewed()];
+    await t.app.work();
+    const job = await jobFor(1);
+    expect(job.state).toBe("failed");
+    expect(job.attempts[0].result).toBe("review: the agent edited .git/config");
+    expect(t.github.calls.some((c) => c.op === "push" || c.op === "createDraftPullRequest")).toBe(false);
+    expect(t.github.pulls).toHaveLength(0);
+  });
+
+  test("a fix session that edits the git config while rejecting every finding still fails before publish", async () => {
+    const { harness } = await ready();
+    harness.script = [
+      discovered(), briefed(), implemented(), reviewing(STANDARD), reviewing(),
+      (options) => (tamper(options), { ok: true, output: { decisions: [{ id: "S1", decision: "rejected", reason: "nothing to change" }], commit_message: "x" }, log: "fix log" }),
+    ];
+    await t.app.work();
+    expect((await jobFor(1)).attempts[0].result).toBe("review: the agent edited .git/config");
+    expect(t.github.calls.some((c) => c.op === "push")).toBe(false);
+  });
+
+  for (const [name, breakTest] of [
+    ["a fix that deletes a new test file fails the attempt", (workspace: string) => rmSync(join(workspace, "test/f.test.ts"))],
+    ["a fix that edits a new test file fails the attempt", (workspace: string) => writeFileSync(join(workspace, "test/f.test.ts"), "test('nothing', () => {});\n")],
+  ] as const) {
+    test(name, async () => {
+      const { harness } = await ready();
+      harness.script = [
+        discovered(), briefed(), implemented(), reviewing(STANDARD), reviewing(),
+        (options) => {
+          breakTest(options.workspace);
+          return { ok: true, output: { decisions: [{ id: "S1", decision: "fixed", reason: "removed the failing test" }], commit_message: "y" }, log: "fix log" };
+        },
+      ];
+      await t.app.work();
+      const job = await jobFor(1);
+      expect(job.state).toBe("failed");
+      expect(job.attempts[0].result).toBe("fix: the fix deletes or edits the test file test/f.test.ts");
+      expect(job.attempts[0].commits).toHaveLength(1);
+      expect(t.github.pulls).toHaveLength(0);
+    });
+  }
+
+  for (const [name, output, prefixCheck] of [
+    ["a duplicate finding id in one axis", { findings: [STANDARD, { ...STANDARD }] }, "standards"],
+    ["a finding id without the axis prefix", { findings: [{ ...STANDARD, id: "F1" }] }, "standards"],
+  ] as const) {
+    test(`${name} is rejected as bad output`, async () => {
+      const { harness } = await ready();
+      harness.script = [discovered(), briefed(), implemented(), reviewed(output), reviewed()];
+      await t.app.work();
+      const job = await jobFor(1);
+      expect(job.state).toBe("failed");
+      expect(job.attempts[0].result).toBe(`review/${prefixCheck}: bad_output`);
+      expect(t.github.pulls).toHaveLength(0);
+    });
+  }
+
+  test("a Spec finding id with the Standards prefix is rejected as bad output", async () => {
+    const { harness } = await ready();
+    harness.script = [discovered(), briefed(), implemented(), reviewing(), reviewed({ findings: [STANDARD] })];
+    await t.app.work();
+    expect((await jobFor(1)).attempts[0].result).toBe("review/spec: bad_output");
+  });
+
   test("a fix that marks a finding fixed but changes nothing fails the attempt, so the PR cannot claim an unfixed finding", async () => {
     const { harness } = await ready();
     harness.script = [discovered(), briefed(), implemented(), reviewing(STANDARD), reviewing(), fixing({}, [{ id: "S1", decision: "fixed", reason: "done" }])];
@@ -1095,7 +1163,7 @@ describe("review loop", () => {
     expect(run.prompt).toContain(STANDARD.rationale);
     expect(run.prompt).toContain(SPEC.rationale);
     expect(run.prompt).toContain(CONVENTIONS.commit_style);
-    expect(run.timeoutMs).toBe(20 * 60_000);
+    expect(run.timeoutMs).toBe(FIX_TIMEOUT_MS);
     expect(run.schema.required).toEqual(["decisions", "commit_message"]);
   });
 });

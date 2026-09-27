@@ -74,7 +74,11 @@ export const gitConfigHash = (workspace: string) => new Bun.CryptoHasher("sha256
  * Stages everything the agent changed since head, folding in any commit the agent made, and returns why the change
  * cannot be committed, or the changed paths (empty when nothing changed).
  */
-export async function stageChange(workspace: string, head: string, configHash: string): Promise<{ error: string } | { changed: { mode: string; path: string }[] }> {
+export async function stageChange(
+  workspace: string,
+  head: string,
+  configHash: string,
+): Promise<{ error: string } | { changed: { mode: string; status: string; path: string }[] }> {
   // Checked before any git call here: an edited config would run its commands on the controller.
   if (gitConfigHash(workspace) !== configHash) return { error: "the agent edited .git/config" };
   const git = (args: string[]) => $`git -C ${workspace} ${args}`.quiet();
@@ -82,8 +86,11 @@ export async function stageChange(workspace: string, head: string, configHash: s
   await git(["add", "-A"]);
   // ":old-mode new-mode old-sha new-sha status\0path\0" per changed path.
   const fields = (await git(["diff", "--cached", "--raw", "-z", "--no-renames", head])).text().split("\0");
-  const changed: { mode: string; path: string }[] = [];
-  for (let i = 0; i + 1 < fields.length; i += 2) changed.push({ mode: fields[i]!.split(" ")[1]!, path: fields[i + 1]! });
+  const changed: { mode: string; status: string; path: string }[] = [];
+  for (let i = 0; i + 1 < fields.length; i += 2) {
+    const [raw, path] = [fields[i]!.split(" "), fields[i + 1]!];
+    changed.push({ mode: raw[1]!, status: raw[4]!, path });
+  }
 
   const workflow = changed.find((c) => c.path.startsWith(".github/workflows/"));
   if (workflow) return { error: `the diff edits CI configuration: ${workflow.path}` };
