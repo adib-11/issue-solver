@@ -53,6 +53,8 @@ async function ready(issues = [issue(1)]) {
   t.github.repos.set(10, [repo(1)]);
   t.github.issues.set(1, issues);
   const remote = await t.remote("octo/app", { "package.json": "{}", "README.md": "hi" });
+  // Like the real suite: the tests fail until the change adds src/f.ts.
+  t.sandbox.script = (command, dir) => (command.startsWith("bun test") && !existsSync(join(dir, "src/f.ts")) ? 1 : 0);
   await t.app.scan();
   return { harness: t.harnesses[0]!, remote };
 }
@@ -115,6 +117,8 @@ describe("worker", () => {
           { name: "conventions", outcome: "ok", log: "discovery log" },
           { name: "brief", outcome: "ok", log: "brief log" },
           { name: "implement", outcome: "ok", log: "implement log" },
+          { name: "red/green", outcome: "ok" },
+          { name: "checks", outcome: "ok" },
         ],
       },
     ]);
@@ -162,7 +166,7 @@ describe("conventions", () => {
     harness.script = [discovered(), ...solved(), ...solved()];
     await t.app.work();
     expect(harness.runs.filter((r) => r.prompt === CONVENTIONS_PROMPT)).toHaveLength(1);
-    expect((await jobFor(2)).attempts[0].phases.map((p: any) => p.name)).toEqual(["brief", "implement"]);
+    expect((await jobFor(2)).attempts[0].phases.map((p: any) => p.name)).toEqual(["brief", "implement", "red/green", "checks"]);
     expect(await t.json("/api/repos")).toEqual([
       { id: 1, full_name: "octo/app", discovered: CONVENTIONS, discovered_at: "2026-01-01T00:00:00.000Z", override: null },
     ]);
@@ -220,7 +224,7 @@ describe("conventions", () => {
     await t.post("/api/repos/1/override", CONVENTIONS, "PUT");
     harness.script = [...solved()];
     await t.app.work();
-    expect((await jobFor(1)).attempts[0]).toMatchObject({ result: expect.stringContaining("Pipeline ends here"), phases: [{ name: "brief" }, { name: "implement" }] });
+    expect((await jobFor(1)).attempts[0]).toMatchObject({ result: expect.stringContaining("Pipeline ends here"), phases: [{ name: "brief" }, { name: "implement" }, { name: "red/green" }, { name: "checks" }] });
   });
 
   test("an invalid override is refused, as is an unknown repo", async () => {
@@ -414,7 +418,7 @@ describe("brief", () => {
     const job = await jobFor(1);
     expect(job.attempts).toHaveLength(2);
     expect(job.attempts[1].issue.body).toBe("Clarified: the /users endpoint returns 500.");
-    expect(job.attempts[1].phases.map((p: any) => p.name)).toEqual(["brief", "implement"]);
+    expect(job.attempts[1].phases.map((p: any) => p.name)).toEqual(["brief", "implement", "red/green", "checks"]);
     expect(harness.runs[2]!.prompt).toContain("Clarified: the /users endpoint returns 500.");
     expect((await t.post(`/api/jobs/${id}/retry`)).status).toBe(409);
   });
@@ -558,5 +562,168 @@ describe("implement", () => {
     harness.script = [discovered(), briefed(), () => ({ ok: false, error: "timeout", log: "x" })];
     await t.app.work();
     expect((await jobFor(1)).attempts[0]).toMatchObject({ result: "implement: timeout", commits: [] });
+  });
+});
+
+describe("red/green and checks", () => {
+  const phase = (attempt: any, name: string) => attempt.phases.find((p: any) => p.name === name);
+  const noTests = { ...CONVENTIONS, has_tests: false, test_file_command: "" };
+
+  test("each new test fails on base and passes on the change, then the checks pass; job detail shows every command and result", async () => {
+    const { harness } = await ready();
+    harness.script = [discovered(), ...solved()];
+    await t.app.work();
+    const attempt = (await jobFor(1)).attempts[0];
+    expect(attempt.result).toContain("Pipeline ends here");
+    expect(phase(attempt, "red/green")).toMatchObject({
+      outcome: "ok",
+      output: {
+        runs: [
+          { on: "base", command: "bun install", exit_code: 0 },
+          { on: "base", command: "bun test test/f.test.ts", exit_code: 1 },
+          { on: "head", command: "bun install", exit_code: 0 },
+          { on: "head", command: "bun test test/f.test.ts", exit_code: 0 },
+        ],
+      },
+    });
+    expect(phase(attempt, "red/green").log).toContain("output of bun test test/f.test.ts");
+    expect(phase(attempt, "checks")).toMatchObject({
+      outcome: "ok",
+      output: {
+        runs: [
+          { on: "head", command: "bun install", exit_code: 0 },
+          { on: "head", command: "bun test", exit_code: 0 },
+          { on: "head", command: "bun run typecheck", exit_code: 0 },
+        ],
+      },
+    });
+    for (const run of t.sandbox.runs) {
+      expect(run.timeoutMs).toBe(15 * 60_000);
+      expect(run.dir).not.toBe(harness.runs[0]!.workspace);
+      expect(run.dir).toStartWith(t.config.workspacesDir);
+      expect(existsSync(run.dir)).toBe(false);
+    }
+  });
+
+  test("the sandbox gets a clean copy of each commit, never the checkout itself", async () => {
+    const { harness } = await ready();
+    const seen = new Set<string>();
+    t.sandbox.script = (command, dir) => {
+      const f = join(dir, "src/f.ts");
+      seen.add(`${existsSync(f) ? readFileSync(f, "utf8").trim() : "no src/f.ts"}, scratch: ${existsSync(join(dir, "scratch.txt"))}`);
+      return command === "bun test" && !existsSync(f) ? 1 : 0;
+    };
+    harness.script = [
+      discovered({ ...CONVENTIONS, test_file_command: "" }),
+      briefed(),
+      (options) => {
+        const result = implemented()(options);
+        writeFileSync(join(options.workspace, ".git/info/exclude"), "scratch.txt\n");
+        writeFileSync(join(options.workspace, "scratch.txt"), "not committed");
+        return result;
+      },
+    ];
+    await t.app.work();
+    expect((await jobFor(1)).attempts[0].result).toContain("Pipeline ends here");
+    expect(seen).toEqual(new Set(["no src/f.ts, scratch: false", `${CHANGE["src/f.ts"].trim()}, scratch: false`]));
+  });
+
+  test("a new test that passes on base fails the attempt as tautological, before the checks", async () => {
+    const { harness } = await ready();
+    t.sandbox.script = () => 0;
+    harness.script = [discovered(), ...solved()];
+    await t.app.work();
+    const attempt = (await jobFor(1)).attempts[0];
+    expect((await jobFor(1)).state).toBe("failed");
+    expect(attempt.result).toMatch(/^red\/green: .*tautological.*test\/f\.test\.ts/);
+    expect(phase(attempt, "red/green").outcome).toBe("failed");
+    expect(phase(attempt, "checks")).toBeUndefined();
+  });
+
+  test("a new test that fails on the change fails the attempt", async () => {
+    const { harness } = await ready();
+    t.sandbox.script = (command) => (command.startsWith("bun test") ? { exitCode: 1, log: "expected 2, got 1" } : 0);
+    harness.script = [discovered(), ...solved()];
+    await t.app.work();
+    const { result } = (await jobFor(1)).attempts[0];
+    expect(result).toMatch(/^red\/green: `bun test test\/f\.test\.ts` fails on the change/);
+    expect(result).toContain("expected 2, got 1");
+  });
+
+  test("a test file path is shell-quoted into the single-test-file command", async () => {
+    const { harness } = await ready();
+    const file = "test/it's f.test.ts";
+    harness.script = [discovered(), briefed(), implemented({ ...CHANGE, [file]: "x" }, { ...IMPLEMENTED, tests_added: [{ file, name: "f" }] })];
+    await t.app.work();
+    expect(t.sandbox.runs[0]!.commands).toEqual([`bun test 'test/it'\\''s f.test.ts'`]);
+  });
+
+  test("without a single-test-file command, the full check runs on base with the new test files overlaid; a compile failure counts as red", async () => {
+    const { harness } = await ready();
+    t.sandbox.script = (command, dir) => (command === "bun run typecheck" && existsSync(join(dir, "test/f.test.ts")) && !existsSync(join(dir, "src/f.ts")) ? 2 : 0);
+    harness.script = [discovered({ ...CONVENTIONS, test_file_command: "" }), ...solved()];
+    await t.app.work();
+    const attempt = (await jobFor(1)).attempts[0];
+    expect(attempt.result).toContain("Pipeline ends here");
+    expect(phase(attempt, "red/green").output.runs).toEqual([
+      { on: "base", command: "bun install", exit_code: 0 },
+      { on: "base", command: "bun test", exit_code: 0 },
+      { on: "base", command: "bun run typecheck", exit_code: 2 },
+    ]);
+    expect(phase(attempt, "checks").outcome).toBe("ok");
+  });
+
+  test("without a single-test-file command, checks that all pass on base with the new tests fail the attempt as tautological", async () => {
+    const { harness } = await ready();
+    t.sandbox.script = () => 0;
+    harness.script = [discovered({ ...CONVENTIONS, test_file_command: "" }), ...solved()];
+    await t.app.work();
+    expect((await jobFor(1)).attempts[0].result).toMatch(/^red\/green: .*tautological/);
+  });
+
+  test("a repo without tests skips red/green and records it; the checks still run", async () => {
+    const { harness } = await ready();
+    harness.script = [discovered(noTests), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] })];
+    await t.app.work();
+    const attempt = (await jobFor(1)).attempts[0];
+    expect(attempt.result).toContain("Pipeline ends here");
+    expect(phase(attempt, "red/green")).toMatchObject({ outcome: "skipped", output: { runs: [], skipped: expect.stringContaining("no tests") } });
+    expect(phase(attempt, "checks").outcome).toBe("ok");
+  });
+
+  test("a failing check fails the attempt with the command and a tail of its output, and every check's result is shown", async () => {
+    const { harness } = await ready();
+    const log = `${"noise\n".repeat(2000)}src/f.ts(1,1): error TS2322`;
+    const suite = t.sandbox.script;
+    t.sandbox.script = (command, dir) => (command === "bun run typecheck" ? { exitCode: 2, log } : suite(command, dir));
+    harness.script = [discovered(), ...solved()];
+    await t.app.work();
+    const job = await jobFor(1);
+    const attempt = job.attempts[0];
+    expect(job.state).toBe("failed");
+    expect(attempt.result).toMatch(/^checks: `bun run typecheck` exited 2/);
+    expect(attempt.result).toEndWith("src/f.ts(1,1): error TS2322");
+    expect(attempt.result.length).toBeLessThan(3000);
+    expect(phase(attempt, "checks")).toMatchObject({ outcome: "failed", output: { runs: [{ exit_code: 0 }, { exit_code: 0 }, { command: "bun run typecheck", exit_code: 2 }] } });
+  });
+
+  test("a failing setup fails the attempt naming it", async () => {
+    const { harness } = await ready();
+    t.sandbox.script = (command) => (command === "bun install" ? { exitCode: 1, log: "lockfile mismatch" } : 0);
+    harness.script = [discovered(noTests), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] })];
+    await t.app.work();
+    const attempt = (await jobFor(1)).attempts[0];
+    expect(attempt.result).toMatch(/^checks: `bun install` exited 1:\nlockfile mismatch$/);
+    expect(phase(attempt, "checks").output.runs).toEqual([{ on: "head", command: "bun install", exit_code: 1 }]);
+  });
+
+  test("a sandbox timeout fails the attempt naming the phase", async () => {
+    const { harness } = await ready();
+    t.sandbox.script = (command) => (command === "bun run typecheck" ? "timeout" : 0);
+    harness.script = [discovered(noTests), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] })];
+    await t.app.work();
+    const attempt = (await jobFor(1)).attempts[0];
+    expect(attempt.result).toBe("checks: timeout");
+    expect(phase(attempt, "checks").outcome).toBe("timeout");
   });
 });

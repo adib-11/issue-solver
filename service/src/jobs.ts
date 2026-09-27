@@ -65,6 +65,12 @@ export type Brief = {
   questions: string[];
 };
 
+/** A command the controller ran in a sandbox: on the base with the new test files overlaid, or on the change. */
+export type CommandRun = { on: "base" | "head"; command: string; exit_code: number };
+
+/** The red/green and checks phases' output. */
+export type CommandRuns = { runs: CommandRun[]; /** Why the phase was skipped, when it was. */ skipped?: string };
+
 export type Phase = {
   name: string;
   started_at: string;

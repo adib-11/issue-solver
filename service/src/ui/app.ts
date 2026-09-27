@@ -1,6 +1,6 @@
 // Dashboard. Everything from the API is rendered with textContent only; see scripts/no-html-insertion.sh.
 import type { AuthCheckState, SetupView as Setup } from "../harness";
-import { type Brief, type Conventions, JOB_STATES, type Job, type JobDetail, type RepoView, UNTRUSTED_AUTHOR } from "../jobs";
+import { type Brief, type CommandRuns, type Conventions, JOB_STATES, type Job, type JobDetail, type RepoView, UNTRUSTED_AUTHOR } from "../jobs";
 
 type JobPage = { jobs: Job[]; page: number; pageSize: number; total: number };
 
@@ -122,6 +122,15 @@ function renderBrief(brief: Brief) {
   return el("div", {}, pre(brief.brief), list("Acceptance criteria", brief.acceptance_criteria), list("Seams", brief.seams));
 }
 
+/** The red/green and checks phases' commands, each with where it ran and its exit code. */
+function renderRuns(phase: JobDetail["attempts"][number]["phases"][number]) {
+  if (phase.name !== "red/green" && phase.name !== "checks") return [];
+  const output = phase.output as CommandRuns | null;
+  if (!output) return [];
+  if (output.skipped) return [el("p", { class: "my-2 break-words", textContent: `Skipped: ${output.skipped}` })];
+  return [list("Commands", output.runs.map((r) => `${r.on === "base" ? "on base, with the new tests" : "on the change"}: ${r.command} → exit ${r.exit_code}`))];
+}
+
 function renderAttempt(attempt: JobDetail["attempts"][number], number: number) {
   const brief = attempt.phases.find((p) => p.name === "brief" && p.output)?.output as Brief | undefined;
   return section(
@@ -142,6 +151,7 @@ function renderAttempt(attempt: JobDetail["attempts"][number], number: number) {
         "details",
         { class: "border-t border-slate-200 py-2" },
         el("summary", { class: `cursor-pointer ${focusRing}`, textContent: `${phase.name}: ${phase.outcome ?? "running"}` }),
+        ...renderRuns(phase),
         pre(phase.log || "(no output)"),
       ),
     ),

@@ -5,7 +5,7 @@ import { codex } from "./codex";
 import { realClock } from "./clock";
 import { loadConfig, type Config } from "./config";
 import { createGitHubClient } from "./github";
-import { dockerRunner } from "./runner";
+import { dockerRunner, dockerSandbox } from "./runner";
 
 let config: Config;
 try {
@@ -26,7 +26,8 @@ const runner = dockerRunner({
     codex: { env: ["CODEX_HOME"], mounts: [`type=volume,src=${config.codexVolume},dst=${config.codexHome}`] },
   },
 });
-const app = createApp({ config, github: createGitHubClient(config.appId, config.privateKey), clock: realClock, harnesses, runner });
+const sandbox = dockerSandbox({ image: config.runnerImage, volume: config.workspaceVolume });
+const app = createApp({ config, github: createGitHubClient(config.appId, config.privateKey), clock: realClock, harnesses, runner, sandbox });
 Bun.serve({ port: config.port, fetch: app.fetch });
 console.log(`auto-solve listening on port ${config.port}`);
 await app.start();

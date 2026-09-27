@@ -8,7 +8,7 @@ import type { Config } from "../src/config";
 import type { GitHub, Installation, Issue, Repo } from "../src/github";
 import type { IssueComment } from "../src/jobs";
 import type { AuthState, Harness, RunOptions, RunResult } from "../src/harness";
-import type { Runner } from "../src/runner";
+import type { Runner, Sandbox, SandboxRun } from "../src/runner";
 
 export class FakeGitHub implements GitHub {
   installations: Installation[] = [];
@@ -112,6 +112,25 @@ export class FakeRunner implements Runner {
   }
 }
 
+export class FakeSandbox implements Sandbox {
+  /** Each command's exit code, or its result, given the directory it runs in; everything exits 0 by default. */
+  script: (command: string, dir: string) => number | Omit<SandboxRun, "command"> | "timeout" = () => 0;
+  runs: { dir: string; setup: string; commands: string[]; timeoutMs: number }[] = [];
+
+  async run(dir: string, setup: string, commands: string[], timeoutMs: number) {
+    this.runs.push({ dir, setup, commands, timeoutMs });
+    const runs: SandboxRun[] = [];
+    for (const [i, command] of [setup, ...commands].entries()) {
+      if (!command) continue;
+      const result = this.script(command, dir);
+      if (result === "timeout") return { runs, timedOut: true };
+      runs.push(typeof result === "number" ? { command, exitCode: result, log: `output of ${command}` } : { command, ...result });
+      if (i === 0 && runs.at(-1)!.exitCode) break;
+    }
+    return { runs, timedOut: false };
+  }
+}
+
 export class FakeClock implements Clock {
   private timers: { every: number; due: number; fn: () => Promise<void> | void }[] = [];
   constructor(public ms = Date.parse("2026-01-01T00:00:00Z")) {}
@@ -193,7 +212,8 @@ export function setup() {
   github.installations = [{ id: 10, account: { login: OWNER, type: "User" } }];
   const harnesses = [new FakeHarness("claude-code", "token-1"), new FakeHarness("other")];
   const runner = new FakeRunner();
-  let app = createApp({ config, github, clock, harnesses, runner });
+  const sandbox = new FakeSandbox();
+  let app = createApp({ config, github, clock, harnesses, runner, sandbox });
 
   const auth = { Authorization: `Basic ${btoa(`admin:${PASSWORD}`)}` };
   async function get(path: string, headers: Record<string, string> = auth) {
@@ -216,10 +236,11 @@ export function setup() {
     /** A new app on the same database, as after a service restart. */
     restart() {
       app.stop();
-      app = createApp({ config, github, clock, harnesses, runner });
+      app = createApp({ config, github, clock, harnesses, runner, sandbox });
     },
     harnesses,
     runner,
+    sandbox,
     /** A git repository standing in for the GitHub repo fullName, with one commit of these files. */
     async remote(fullName: string, files: Record<string, string>) {
       const path = join(dir, "remotes", fullName);
