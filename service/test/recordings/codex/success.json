@@ -1,0 +1,5 @@
+{
+  "exit": 0,
+  "stderr": "OpenAI Codex v0.157.1\n--------\nworkdir: /work\nmodel: gpt-5.5\nprovider: openai\napproval: never\nsandbox: danger-full-access\n--------\nuser\nFix issue #7\nexec\nbash -lc 'ls' in /work\nsucceeded in 12ms\ncodex\n{\"summary\":\"Adds a --dry-run flag\",\"tests\":[\"test/cli.test.ts\"]}\ntokens used\n8,123\n",
+  "stdout": [{"summary":"Adds a --dry-run flag","tests":["test/cli.test.ts"]}]
+}

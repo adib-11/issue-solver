@@ -33,8 +33,14 @@ type RepoRow = {
 const LOG_LIMIT_BYTES = 200 * 1024;
 const PIPELINE_ENDS = "Pipeline ends here: the phases after brief are not built yet.";
 const INTERRUPTED = "Interrupted by a restart";
-// GitHub tokens and Claude tokens, wherever they come from; configured harness credentials are redacted by value too.
-const SECRET_PATTERNS = [/\bgh[pousr]_[A-Za-z0-9]{20,}/g, /\bgithub_pat_[A-Za-z0-9_]{20,}/g, /\bsk-ant-[A-Za-z0-9_-]+/g];
+// GitHub tokens, Claude tokens, and JWTs (Codex's ChatGPT tokens), wherever they come from; configured harness
+// credentials are redacted by value too.
+const SECRET_PATTERNS = [
+  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
+  /\bsk-ant-[A-Za-z0-9_-]+/g,
+  /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
+];
 const FILTER_REASONS = ["closed", "assigned", "open closing PR", "referenced by open PR"] as const;
 
 /** The skill bundle's candidate filter (skills/solve-issue/scripts/candidates.jq): work already in flight. */
@@ -218,7 +224,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   ) {
     setPhase.run(name, now(), job.id);
     const phase = startPhase.get(attemptId, name, now())!;
-    let result = await harness.run({ ...options, workspace, wrap: runner.command(workspace) });
+    let result = await harness.run({ ...options, workspace, wrap: runner.command(workspace, harness.name) });
     const invalid = result.ok && check(result.output);
     if (invalid) result = { ok: false, error: "bad_output", log: `${result.log}\nOutput rejected: ${invalid}` };
     const output = result.ok ? JSON.stringify(result.output) : null;
@@ -431,7 +437,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     const harness = harnesses.find((h) => h.name === getSetting("harness"));
     if (!harness) return c.json({ error: "Choose a harness first" }, 409);
     const { state, log } = await harness.checkAuth();
-    setSetting("auth", { state, checkedAt: iso(clock.now()), log });
+    setSetting("auth", { state, checkedAt: iso(clock.now()), log: capLog(redact(log)) });
     const pause = PAUSE_REASONS[state];
     if (state === "ok") deleteSetting("paused");
     else if (pause) setSetting("paused", pause);

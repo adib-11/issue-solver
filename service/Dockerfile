@@ -17,7 +17,7 @@ COPY service/src ./src
 COPY skills /skills
 COPY --from=build /app/dist ./dist
 ENV PATH=/app/node_modules/.bin:$PATH
-RUN mkdir -p /data /workspaces && chown bun:bun /data /workspaces
+RUN mkdir -p /data /workspaces /codex && chown bun:bun /data /workspaces /codex
 USER bun
 EXPOSE 3000
 CMD ["bun", "src/main.ts"]

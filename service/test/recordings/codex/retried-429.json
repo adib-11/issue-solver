@@ -1,0 +1,5 @@
+{
+  "exit": 0,
+  "stderr": "OpenAI Codex v0.157.1\nstream error: unexpected status 429 Too Many Requests; retrying 1/5 in 1.2s…\ncodex\ndone\n",
+  "stdout": [{"summary":"Adds a --dry-run flag","tests":["test/cli.test.ts"]}]
+}

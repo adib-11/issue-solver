@@ -1,0 +1,1 @@
+{ "exit": 0, "stderr": "OpenAI Codex v0.157.1\n", "stdout": [{"summary":"Adds a --dry-run flag"}] }

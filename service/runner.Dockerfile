@@ -6,5 +6,7 @@ WORKDIR /opt/harness
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --production
 ENV PATH=/opt/harness/node_modules/.bin:$PATH
+# Owned by the runner user, so the codex volume is writable the first time it is mounted here (the Codex login).
+RUN mkdir /codex && chown bun:bun /codex
 USER bun
 WORKDIR /work

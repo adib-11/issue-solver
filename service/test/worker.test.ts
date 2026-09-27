@@ -74,7 +74,7 @@ describe("worker", () => {
 
     const [run] = harness.runs;
     expect(run!.workspace).toStartWith(t.config.workspacesDir);
-    expect(run!.wrap).toEqual(["runner", run!.workspace]);
+    expect(run!.wrap).toEqual(["runner", "claude-code", run!.workspace]);
     expect(run!.timeoutMs).toBe(10 * 60_000);
     expect(run!.schema.required).toEqual(["setup_command", "check_commands", "test_file_command", "has_tests", "commit_style", "notes"]);
     expect(seen).toEqual({ files: "{}", hooksPath: "/dev/null" });
@@ -262,7 +262,7 @@ describe("harness errors", () => {
 
 test("phase logs are redacted and capped at the last 200 KiB", async () => {
   const { harness } = await ready();
-  const secrets = "token-1 ghs_16C7e42F292c6912E7710c838347Ae178B4a sk-ant-oat01-abc_DEF-123";
+  const secrets = "token-1 ghs_16C7e42F292c6912E7710c838347Ae178B4a sk-ant-oat01-abc_DEF-123 eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJl";
   harness.script = [discovered(CONVENTIONS, `${"x".repeat(300 * 1024)} ${secrets} END`), briefed()];
   await t.app.work();
   const { log } = (await jobFor(1)).attempts[0].phases[0];

@@ -3,8 +3,8 @@ import { basename } from "node:path";
 
 /** Where agent phases run. Tests replace this with a fake. */
 export interface Runner {
-  /** The command prefix that runs a CLI in a fresh runner container with this workspace as its working directory. */
-  command(workspace: string): string[];
+  /** The command prefix that runs the harness's CLI in a fresh runner container with this workspace as its working directory. */
+  command(workspace: string, harness: string): string[];
   /** Removes every runner container, finished or not. */
   cleanup(): Promise<void>;
 }
@@ -12,13 +12,16 @@ export interface Runner {
 // ponytail: one label for every runner on the Docker host; scope it per controller if two ever share a daemon.
 const LABEL = "auto-solve.runner";
 
+/** What a harness's runner containers get on top of the workspace: variable names and --mount specs. */
+export type RunnerAccess = { env?: string[]; mounts?: string[] };
+
 /**
  * Disposable nonroot Docker containers with the workspace (a directory on the workspaces volume) mounted at /work.
- * Only the variables named here reach the container, and no socket or host path is mounted.
+ * Only the chosen harness's own variables and mounts reach the container, and no socket or host path is mounted.
  */
-export function dockerRunner(options: { image: string; volume: string; env: string[] }): Runner {
+export function dockerRunner(options: { image: string; volume: string; access: Record<string, RunnerAccess> }): Runner {
   return {
-    command: (workspace) => [
+    command: (workspace, harness) => [
       "docker", "run", "--rm", "-i", "--label", LABEL,
       "--user", "1000:1000",
       "--cpus", "2", "--memory", "4g", "--memory-swap", "4g", "--pids-limit", "256",
@@ -26,7 +29,8 @@ export function dockerRunner(options: { image: string; volume: string; env: stri
       "--mount", `type=volume,src=${options.volume},dst=/work,volume-subpath=${basename(workspace)}`,
       "--workdir", "/work",
       // Names without values: docker copies them from its own environment, keeping secrets off the command line.
-      ...options.env.flatMap((name) => ["--env", name]),
+      ...(options.access[harness]?.env ?? []).flatMap((name) => ["--env", name]),
+      ...(options.access[harness]?.mounts ?? []).flatMap((spec) => ["--mount", spec]),
       options.image,
     ],
     async cleanup() {

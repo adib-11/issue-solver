@@ -7,6 +7,10 @@ export type Config = {
   adminPassword: string;
   /** Subscription token from `claude setup-token`; optional because the harness is chosen on the setup page. */
   claudeOauthToken?: string;
+  /** CODEX_HOME: where Codex keeps its ChatGPT login (auth.json); the codex volume is mounted here and in runners. */
+  codexHome: string;
+  /** The Docker volume holding codexHome. */
+  codexVolume: string;
   dbPath: string;
   /** Per-attempt checkouts; the workspaces volume is mounted here. */
   workspacesDir: string;
@@ -40,6 +44,8 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     privateKey,
     adminPassword,
     claudeOauthToken: env.CLAUDE_CODE_OAUTH_TOKEN?.trim() || undefined,
+    codexHome: env.CODEX_HOME || "/codex",
+    codexVolume: env.CODEX_VOLUME || "auto-solve-codex",
     dbPath: env.DB_PATH || "/data/auto-solve.sqlite",
     workspacesDir: env.WORKSPACES_DIR || "/workspaces",
     runnerImage: env.RUNNER_IMAGE || "auto-solve-runner:local",

@@ -1,0 +1,5 @@
+{
+  "exit": 1,
+  "stderr": "OpenAI Codex v0.157.1\nuser\nIssue: map any 429 to quota and 401 Unauthorized to auth; set forced_login_method.\nexec\nbun test in /work\ntest/api.test.ts: expected 429, got 401 Unauthorized\nERROR: unexpected failure in the agent loop\n",
+  "stdout": []
+}
