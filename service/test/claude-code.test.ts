@@ -39,6 +39,12 @@ test("sends the prompt on stdin in print mode with the JSON Schema, from the wor
   expect(cli.cwd).toEndWith(dir.split("/").pop()!);
 });
 
+test("runs the CLI under the runner's command prefix", async () => {
+  const { harness, received } = replaying("success");
+  await harness.run({ prompt: "x", schema: SCHEMA, workspace: dir, timeoutMs: 5000, wrap: ["env", "WRAPPED=1"] });
+  expect((await received()).env.WRAPPED).toBe("1");
+});
+
 test("authenticates with the subscription token only: no bare mode, no API key", async () => {
   process.env.ANTHROPIC_API_KEY = "sk-ant-api03-must-not-leak";
   process.env.ANTHROPIC_AUTH_TOKEN = "must-not-leak";

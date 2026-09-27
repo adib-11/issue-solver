@@ -1,6 +1,6 @@
 // Dashboard. Everything from the API is rendered with textContent only; see scripts/no-html-insertion.sh.
 import type { AuthCheckState, SetupView as Setup } from "../harness";
-import { JOB_STATES, type Job, UNTRUSTED_AUTHOR } from "../jobs";
+import { type Conventions, JOB_STATES, type Job, type JobDetail, type RepoView, UNTRUSTED_AUTHOR } from "../jobs";
 
 type JobPage = { jobs: Job[]; page: number; pageSize: number; total: number };
 
@@ -28,13 +28,19 @@ const badge = (job: Job) =>
     textContent: job.skip_reason ? `${job.state}: ${job.skip_reason}` : job.state,
   });
 
+const pre = (text: string) => el("pre", { class: "overflow-x-auto whitespace-pre-wrap break-words text-sm", textContent: text });
+const section = (title: string, ...children: Child[]) =>
+  el("section", { class: "rounded border border-slate-200 bg-white p-3" }, el("h3", { class: "mb-2 font-medium break-words", textContent: title }), ...children);
+
 const root = document.getElementById("app")!;
 const view = { filter: "", page: 1 };
 let lastBody = "";
+/** Repos whose form has unsaved edits, so polling does not overwrite them. */
+const editing = new Set<number>();
 
 function route() {
   const match = location.hash.match(/^#\/jobs\/(\d+)$/);
-  return { jobId: match ? Number(match[1]) : undefined, setup: location.hash === "#/setup" };
+  return { jobId: match ? Number(match[1]) : undefined, setup: location.hash === "#/setup", repos: location.hash === "#/repos" };
 }
 
 function notice(text: string, isError = false) {
@@ -108,7 +114,23 @@ function renderList(content: HTMLElement, data: JobPage) {
   );
 }
 
-function renderJob(content: HTMLElement, job: Job) {
+function renderAttempt(attempt: JobDetail["attempts"][number], number: number) {
+  return section(
+    `Attempt ${number} (${attempt.harness})`,
+    el("p", { class: "text-sm text-slate-600" }, "Started ", time(attempt.started_at), ...(attempt.finished_at ? [", finished ", time(attempt.finished_at)] : [])),
+    el("p", { class: "my-2 break-words", textContent: attempt.result ?? "Running…" }),
+    ...attempt.phases.map((phase) =>
+      el(
+        "details",
+        { class: "border-t border-slate-200 py-2" },
+        el("summary", { class: `cursor-pointer ${focusRing}`, textContent: `${phase.name}: ${phase.outcome ?? "running"}` }),
+        pre(phase.log || "(no output)"),
+      ),
+    ),
+  );
+}
+
+function renderJob(content: HTMLElement, job: JobDetail) {
   let runAnyway: HTMLElement | null = null;
   if (job.state === "skipped" && job.skip_reason === UNTRUSTED_AUTHOR) {
     const button = el("button", {
@@ -144,11 +166,13 @@ function renderJob(content: HTMLElement, job: Job) {
       "dl",
       { class: "divide-y divide-slate-200 rounded border border-slate-200 bg-white px-3" },
       row("State", badge(job)),
+      ...(job.phase ? [row("Phase", job.phase)] : []),
       row("Issue", el("a", { href: job.issue_url, rel: "noreferrer", class: `text-blue-700 underline ${focusRing}`, textContent: `${job.repo_full_name}#${job.issue_number}` })),
       row("Created", time(job.created_at)),
       row("Updated", time(job.updated_at)),
     ),
     ...(runAnyway ? [runAnyway] : []),
+    el("div", { class: "mt-3 flex flex-col gap-3" }, ...[...job.attempts].reverse().map((a, i) => renderAttempt(a, job.attempts.length - i))),
   );
 }
 
@@ -174,6 +198,7 @@ function renderHeader(setup: Setup) {
   header.replaceChildren(
     el("span", {}, "Harness: ", el("strong", { textContent: harness ? `${harness.label}, ${auth}` : auth })),
     el("span", {}, "Queue: ", el("strong", { textContent: setup.paused ? `paused. ${setup.paused}` : "running" })),
+    el("a", { id: "repos-link", href: "#/repos", class: `text-blue-700 underline ${focusRing}`, textContent: "Repos" }),
     el("a", { id: "setup-link", href: "#/setup", class: `text-blue-700 underline ${focusRing}`, textContent: "Setup" }),
   );
   header.className = `mb-4 flex flex-wrap items-center gap-x-4 gap-y-1 rounded border p-2 text-sm ${warn ? "border-amber-300 bg-amber-50" : "border-slate-200 bg-white"}`;
@@ -189,11 +214,9 @@ function renderSetup(content: HTMLElement, setup: Setup) {
     choices.append(el("label", { class: "flex items-center gap-2", htmlFor: radio.id }, radio, h.label));
   }
   const harness = setup.harnesses.find((h) => h.name === setup.harness);
-  const section = (title: string, ...children: Child[]) =>
-    el("section", { class: "rounded border border-slate-200 bg-white p-3" }, el("h3", { class: "mb-2 font-medium", textContent: title }), ...children);
-  const pre = (text: string) => el("pre", { class: "overflow-x-auto whitespace-pre-wrap break-words text-sm", textContent: text });
-
-  const parts: HTMLElement[] = [el("h2", { class: "text-lg font-semibold", textContent: "Setup" }), section("Choose the harness", choices)];
+  const parts: HTMLElement[] = [el("h2", { class: "text-lg font-semibold", textContent: "Setup" })];
+  if (setup.paused) parts.push(section("Queue paused", el("p", { class: "text-red-800", textContent: setup.paused })));
+  parts.push(section("Choose the harness", choices));
   if (harness) {
     parts.push(section(`Log in to ${harness.label}`, pre(harness.loginHelp)));
     if (setup.credentialSince) {
@@ -213,6 +236,76 @@ function renderSetup(content: HTMLElement, setup: Setup) {
   content.replaceChildren(el("div", { class: "flex flex-col gap-3" }, ...parts));
 }
 
+const input = "w-full rounded border border-slate-300 px-2 py-1";
+function renderRepos(content: HTMLElement, repos: RepoView[]) {
+  const parts: HTMLElement[] = [el("h2", { class: "text-lg font-semibold", textContent: "Repos" })];
+  if (!repos.length) parts.push(notice("No repos yet. Repos the GitHub App can see appear here after the next scan."));
+  for (const repo of repos) {
+    const id = (field: string) => `repo-${repo.id}-${field}`;
+    const shown: Conventions = repo.override ??
+      repo.discovered ?? { setup_command: "", check_commands: [], test_file_command: "", has_tests: false, commit_style: "", notes: "" };
+    const field = (name: string, label: string, control: HTMLInputElement | HTMLTextAreaElement) => {
+      control.id = id(name);
+      control.className = `${input} ${focusRing}`;
+      control.addEventListener("input", () => editing.add(repo.id));
+      return el("label", { class: "flex flex-col gap-1", htmlFor: control.id }, label, control);
+    };
+    const setupCommand = el("input", { type: "text", value: shown.setup_command });
+    const checks = el("textarea", { rows: 3, value: shown.check_commands.join("\n") });
+    const testFile = el("input", { type: "text", value: shown.test_file_command });
+    const commitStyle = el("input", { type: "text", value: shown.commit_style });
+    const notes = el("textarea", { rows: 3, value: shown.notes });
+    const hasTests = el("input", { id: id("has-tests"), type: "checkbox", checked: shown.has_tests, class: focusRing });
+    hasTests.addEventListener("change", () => editing.add(repo.id));
+
+    const status = el("span", { role: "status", class: "text-sm text-red-800" });
+    const save = button(id("save"), "Save override");
+    const clear = button(id("clear"), "Clear override");
+    clear.disabled = !repo.override;
+    const url = `/api/repos/${repo.id}/override`;
+    save.addEventListener("click", () => {
+      const conventions: Conventions = {
+        setup_command: setupCommand.value.trim(),
+        check_commands: checks.value.split("\n").map((c) => c.trim()).filter(Boolean),
+        test_file_command: testFile.value.trim(),
+        has_tests: hasTests.checked,
+        commit_style: commitStyle.value.trim(),
+        notes: notes.value.trim(),
+      };
+      editing.delete(repo.id);
+      act(save, status, url, { method: "PUT", body: JSON.stringify(conventions) }, "Saving the override");
+    });
+    clear.addEventListener("click", () => {
+      editing.delete(repo.id);
+      act(clear, status, url, { method: "PUT", body: "null" }, "Clearing the override");
+    });
+
+    const source = repo.override
+      ? "Using your override."
+      : repo.discovered_at
+        ? el("span", {}, "Using conventions discovered ", time(repo.discovered_at), ".")
+        : "Not discovered yet: the first job on this repo discovers them.";
+    parts.push(
+      section(
+        repo.full_name,
+        el("p", { class: "mb-2 text-sm text-slate-600" }, source),
+        el(
+          "div",
+          { class: "flex flex-col gap-2" },
+          field("setup", "Setup command", setupCommand),
+          field("checks", "Check commands, one per line (none means jobs are skipped)", checks),
+          field("test-file", "Single test file command ({file} is the path)", testFile),
+          el("label", { class: "flex items-center gap-2", htmlFor: hasTests.id }, hasTests, "Has tests"),
+          field("commit-style", "Commit style", commitStyle),
+          field("notes", "Notes", notes),
+          el("div", { class: "flex flex-wrap items-center gap-2" }, save, clear, status),
+        ),
+      ),
+    );
+  }
+  content.replaceChildren(el("div", { class: "flex flex-col gap-3" }, ...parts));
+}
+
 const header = el("div", { id: "status", role: "status" });
 const content = el("div", { id: "content" });
 root.replaceChildren(el("h1", { class: "mb-2 text-xl font-bold" }, el("a", { href: "#/", class: focusRing, textContent: "auto-solve" })), header, content);
@@ -229,15 +322,16 @@ async function refreshHeader() {
 
 async function refresh(showLoading = false) {
   const request = ++latest;
-  const { jobId, setup } = route();
+  const { jobId, setup, repos } = route();
   if (!setup) refreshHeader(); // the setup page's own response renders the header
+  if (repos && editing.size) return; // keep unsaved edits
   if (showLoading) {
     lastBody = "";
     content.replaceChildren(notice("Loading…"));
   }
   const query = new URLSearchParams({ page: String(view.page) });
   if (view.filter) query.set("state", view.filter);
-  const url = setup ? "/api/setup" : jobId === undefined ? `/api/jobs?${query}` : `/api/jobs/${jobId}`;
+  const url = setup ? "/api/setup" : repos ? "/api/repos" : jobId === undefined ? `/api/jobs?${query}` : `/api/jobs/${jobId}`;
   try {
     const res = await fetch(url);
     const body = await res.text();
@@ -251,6 +345,7 @@ async function refresh(showLoading = false) {
     lastBody = body;
     const focusedId = document.activeElement?.id;
     if (setup) renderSetup(content, JSON.parse(body));
+    else if (repos) renderRepos(content, JSON.parse(body));
     else if (jobId === undefined) renderList(content, JSON.parse(body));
     else renderJob(content, JSON.parse(body));
     if (focusedId) document.getElementById(focusedId)?.focus(); // keep keyboard focus across re-renders
@@ -261,7 +356,10 @@ async function refresh(showLoading = false) {
   }
 }
 
-window.addEventListener("hashchange", () => refresh(true));
+window.addEventListener("hashchange", () => {
+  editing.clear();
+  refresh(true);
+});
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") refresh();
 });

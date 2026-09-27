@@ -7,7 +7,14 @@ export type RunError = "auth" | "quota" | "timeout" | "bad_output" | "crash";
 
 export type RunResult = { ok: true; output: unknown; log: string } | { ok: false; error: RunError; log: string };
 
-export type RunOptions = { prompt: string; schema: JsonSchema; workspace: string; timeoutMs: number };
+export type RunOptions = {
+  prompt: string;
+  schema: JsonSchema;
+  workspace: string;
+  timeoutMs: number;
+  /** A command prefix that runs the CLI inside the runner container, which mounts the workspace. */
+  wrap?: string[];
+};
 
 export interface Harness {
   name: string;
@@ -40,6 +47,7 @@ export type JsonSchema = {
   additionalProperties?: boolean;
   items?: JsonSchema;
   enum?: unknown[];
+  description?: string;
 };
 
 // ponytail: covers only the keywords in JsonSchema above; swap in ajv if phase schemas need more.

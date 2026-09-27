@@ -1,11 +1,13 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { $ } from "bun";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createApp } from "../src/app";
 import type { Clock } from "../src/clock";
 import type { Config } from "../src/config";
 import type { GitHub, Installation, Issue, Repo } from "../src/github";
 import type { AuthState, Harness, RunOptions, RunResult } from "../src/harness";
+import type { Runner } from "../src/runner";
 
 export class FakeGitHub implements GitHub {
   installations: Installation[] = [];
@@ -14,6 +16,8 @@ export class FakeGitHub implements GitHub {
   calls: { op: string; args: unknown[] }[] = [];
   failNextListIssues = false;
   failingInstallations = new Set<number>();
+  /** Local git repositories standing in for GitHub remotes, by full name. */
+  remotes = new Map<string, string>();
 
   async listInstallations() {
     this.calls.push({ op: "listInstallations", args: [] });
@@ -34,6 +38,13 @@ export class FakeGitHub implements GitHub {
     }
     const all = this.issues.get(repo.id) ?? [];
     return since === undefined ? all : all.filter((i) => i.updatedAt >= since);
+  }
+
+  async checkout(installationId: number, fullName: string, dir: string) {
+    this.calls.push({ op: "checkout", args: [installationId, fullName] });
+    const remote = this.remotes.get(fullName);
+    if (!remote) throw new Error(`No remote for ${fullName}`);
+    await $`git clone -q ${remote} ${dir}`;
   }
 
   sinceArgs() {
@@ -59,8 +70,25 @@ export class FakeHarness implements Harness {
     return { state: this.authState, log: `${this.name} auth: ${this.authState}` };
   }
 
-  async run(_: RunOptions): Promise<RunResult> {
-    throw new Error("No phase runs a harness yet");
+  /** Scripted runs, answered in order; each sees the options, and the workspace while it still exists. */
+  script: ((options: RunOptions) => RunResult | Promise<RunResult>)[] = [];
+  runs: RunOptions[] = [];
+
+  async run(options: RunOptions): Promise<RunResult> {
+    this.runs.push(options);
+    const next = this.script.shift();
+    if (!next) throw new Error(`${this.name}: no scripted run left`);
+    return next(options);
+  }
+}
+
+export class FakeRunner implements Runner {
+  cleanups = 0;
+  command(workspace: string) {
+    return ["runner", workspace];
+  }
+  async cleanup() {
+    this.cleanups++;
   }
 }
 
@@ -116,6 +144,14 @@ export function repo(id: number, name = "app", over: Partial<Repo> = {}): Repo {
   return { id, full_name: `${OWNER}/${name}`, fork: false, archived: false, ...over };
 }
 
+export async function commit(dir: string, files: Record<string, string>) {
+  for (const [path, content] of Object.entries(files)) {
+    mkdirSync(dirname(join(dir, path)), { recursive: true });
+    writeFileSync(join(dir, path), content);
+  }
+  await $`git -C ${dir} add -A && git -C ${dir} -c user.name=t -c user.email=t@example.com commit -q -m change`;
+}
+
 export function setup() {
   const dir = mkdtempSync(join(tmpdir(), "auto-solve-"));
   const github = new FakeGitHub();
@@ -126,11 +162,15 @@ export function setup() {
     privateKey: "unused",
     adminPassword: PASSWORD,
     dbPath: join(dir, "db.sqlite"),
+    workspacesDir: join(dir, "workspaces"),
+    runnerImage: "runner:test",
+    workspaceVolume: "workspaces",
     port: 0,
   };
   github.installations = [{ id: 10, account: { login: OWNER, type: "User" } }];
   const harnesses = [new FakeHarness("claude-code", "token-1"), new FakeHarness("other")];
-  let app = createApp({ config, github, clock, harnesses });
+  const runner = new FakeRunner();
+  let app = createApp({ config, github, clock, harnesses, runner });
 
   const auth = { Authorization: `Basic ${btoa(`admin:${PASSWORD}`)}` };
   async function get(path: string, headers: Record<string, string> = auth) {
@@ -153,9 +193,19 @@ export function setup() {
     /** A new app on the same database, as after a service restart. */
     restart() {
       app.stop();
-      app = createApp({ config, github, clock, harnesses });
+      app = createApp({ config, github, clock, harnesses, runner });
     },
     harnesses,
+    runner,
+    /** A git repository standing in for the GitHub repo fullName, with one commit of these files. */
+    async remote(fullName: string, files: Record<string, string>) {
+      const path = join(dir, "remotes", fullName);
+      mkdirSync(path, { recursive: true });
+      await $`git init -q -b main ${path}`;
+      await commit(path, files);
+      github.remotes.set(fullName, path);
+      return path;
+    },
     github,
     clock,
     config,
