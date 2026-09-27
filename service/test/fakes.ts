@@ -6,6 +6,7 @@ import { createApp } from "../src/app";
 import type { Clock } from "../src/clock";
 import type { Config } from "../src/config";
 import type { GitHub, Installation, Issue, Repo } from "../src/github";
+import type { IssueComment } from "../src/jobs";
 import type { AuthState, Harness, RunOptions, RunResult } from "../src/harness";
 import type { Runner } from "../src/runner";
 
@@ -45,6 +46,24 @@ export class FakeGitHub implements GitHub {
     const remote = this.remotes.get(fullName);
     if (!remote) throw new Error(`No remote for ${fullName}`);
     await $`git clone -q ${remote} ${dir}`;
+  }
+
+  /** Issue bodies and comments by "fullName#number"; getIssue combines them with the listed issue. */
+  bodies = new Map<string, string>();
+  comments = new Map<string, IssueComment[]>();
+
+  async getIssue(installationId: number, fullName: string, number: number) {
+    this.calls.push({ op: "getIssue", args: [installationId, fullName, number] });
+    const repoId = [...this.repos.values()].flat().find((r) => r.full_name === fullName)?.id;
+    const found = this.issues.get(repoId!)?.find((i) => i.number === number);
+    if (!found) throw new Error(`GitHub 404: ${fullName}#${number}`);
+    const key = `${fullName}#${number}`;
+    const { title, url, state } = found;
+    return { number, title, url, state, body: this.bodies.get(key) ?? `Body of ${number}`, comments: this.comments.get(key) ?? [] };
+  }
+
+  async comment(installationId: number, fullName: string, number: number, body: string) {
+    this.calls.push({ op: "comment", args: [installationId, fullName, number, body] });
   }
 
   sinceArgs() {
@@ -166,6 +185,7 @@ export function setup() {
     runnerImage: "runner:test",
     workspaceVolume: "workspaces",
     port: 0,
+    commentQuestions: false,
   };
   github.installations = [{ id: 10, account: { login: OWNER, type: "User" } }];
   const harnesses = [new FakeHarness("claude-code", "token-1"), new FakeHarness("other")];

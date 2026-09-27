@@ -1,5 +1,6 @@
 import { $ } from "bun";
 import { createSign } from "node:crypto";
+import type { IssueSnapshot } from "./jobs";
 
 export type Installation = { id: number; account: { login: string; type: string } };
 export type Repo = { id: number; full_name: string; fork: boolean; archived: boolean };
@@ -44,6 +45,9 @@ export interface GitHub {
   listIssues(installationId: number, repo: Repo, since: string | undefined): Promise<Issue[]>;
   /** Clones the repo's default branch into dir. No credential is left in the clone. */
   checkout(installationId: number, fullName: string, dir: string): Promise<void>;
+  /** The issue now, with every comment. */
+  getIssue(installationId: number, fullName: string, number: number): Promise<IssueSnapshot>;
+  comment(installationId: number, fullName: string, number: number, body: string): Promise<void>;
 }
 
 const API = "https://api.github.com";
@@ -135,6 +139,25 @@ export function createGitHubClient(appId: string, privateKey: string): GitHub {
       };
       const clone = await $`git -c core.hooksPath=/dev/null clone -q https://github.com/${fullName}.git ${dir}`.env(env).nothrow().quiet();
       if (clone.exitCode !== 0) throw new Error(`git clone of ${fullName} failed: ${clone.stderr.toString().replaceAll(token, "[redacted]")}`);
+    },
+
+    async getIssue(installationId, fullName, number) {
+      const token = await installationToken(installationId);
+      const issue = (await (await request(`/repos/${fullName}/issues/${number}`, token)).json()) as any;
+      const comments = await paginate<any>(`/repos/${fullName}/issues/${number}/comments?per_page=100`, token);
+      return {
+        number,
+        title: issue.title,
+        url: issue.html_url,
+        state: issue.state === "closed" ? "CLOSED" : "OPEN",
+        body: issue.body ?? "",
+        comments: comments.map((c) => ({ author: c.user?.login ?? "ghost", authorAssociation: c.author_association, body: c.body ?? "" })),
+      };
+    },
+
+    async comment(installationId, fullName, number, body) {
+      const token = await installationToken(installationId);
+      await request(`/repos/${fullName}/issues/${number}/comments`, token, { method: "POST", body: JSON.stringify({ body }) });
     },
   };
 }

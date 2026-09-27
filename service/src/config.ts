@@ -14,6 +14,8 @@ export type Config = {
   /** The Docker volume mounted at workspacesDir, which runner containers mount a subpath of. */
   workspaceVolume: string;
   port: number;
+  /** Post needs_info questions as an issue comment; needs the App's Issues write permission. */
+  commentQuestions: boolean;
 };
 
 export function loadConfig(env: Record<string, string | undefined>): Config {
@@ -43,5 +45,6 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     runnerImage: env.RUNNER_IMAGE || "auto-solve-runner:local",
     workspaceVolume: env.WORKSPACE_VOLUME || "auto-solve-workspaces",
     port: Number(env.PORT || 3000),
+    commentQuestions: env.COMMENT_QUESTIONS === "true",
   };
 }

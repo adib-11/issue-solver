@@ -1,0 +1,6 @@
+# The controller image builds from the repository root; it needs only service/ and skills/.
+**/node_modules
+**/dist
+.git
+.claude
+.scratch
