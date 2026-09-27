@@ -3,6 +3,7 @@ import { createSign } from "node:crypto";
 import type { IssueSnapshot } from "./jobs";
 
 export type Installation = { id: number; account: { login: string; type: string } };
+export type PullRequest = { number: number; url: string };
 export type Repo = { id: number; full_name: string; fork: boolean; archived: boolean };
 /** An issue as the GraphQL query below returns it. Pull requests are never included. */
 export type Issue = {
@@ -48,6 +49,13 @@ export interface GitHub {
   /** The issue now, with every comment. */
   getIssue(installationId: number, fullName: string, number: number): Promise<IssueSnapshot>;
   comment(installationId: number, fullName: string, number: number, body: string): Promise<void>;
+  /** The branch's commit on GitHub, or null when there is no such branch. */
+  branchSha(installationId: number, fullName: string, branch: string): Promise<string | null>;
+  /** Pushes sha from the clone in dir to branch, never forcing. */
+  push(installationId: number, fullName: string, dir: string, sha: string, branch: string): Promise<void>;
+  /** The pull request from branch, in any state, or null. */
+  findPullRequest(installationId: number, fullName: string, branch: string): Promise<PullRequest | null>;
+  createDraftPullRequest(installationId: number, fullName: string, pr: { head: string; base: string; title: string; body: string }): Promise<PullRequest>;
 }
 
 const API = "https://api.github.com";
@@ -86,6 +94,23 @@ export function createGitHubClient(appId: string, privateKey: string): GitHub {
       url = res.headers.get("link")?.match(/<([^>]+)>;\s*rel="next"/)?.[1];
     }
     return items;
+  }
+
+  /** Runs git with the installation token as a header from the environment, so it is neither on the command line nor written to .git/config. */
+  async function git(installationId: number, what: string, args: string[]) {
+    const token = await installationToken(installationId);
+    const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
+    const env = {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+      GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
+    };
+    const result = await $`git -c core.hooksPath=/dev/null ${args}`.env(env).nothrow().quiet();
+    const stderr = result.stderr.toString().replaceAll(token, "[redacted]").replaceAll(basic, "[redacted]");
+    if (result.exitCode !== 0) throw new Error(`${what} failed: ${stderr}`);
+    return result.stdout.toString();
   }
 
   async function installationToken(installationId: number) {
@@ -127,18 +152,7 @@ export function createGitHubClient(appId: string, privateKey: string): GitHub {
     },
 
     async checkout(installationId, fullName, dir) {
-      const token = await installationToken(installationId);
-      const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
-      // The header goes through the environment, so it is neither on the command line nor written to .git/config.
-      const env = {
-        ...process.env,
-        GIT_TERMINAL_PROMPT: "0",
-        GIT_CONFIG_COUNT: "1",
-        GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
-        GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
-      };
-      const clone = await $`git -c core.hooksPath=/dev/null clone -q https://github.com/${fullName}.git ${dir}`.env(env).nothrow().quiet();
-      if (clone.exitCode !== 0) throw new Error(`git clone of ${fullName} failed: ${clone.stderr.toString().replaceAll(token, "[redacted]")}`);
+      await git(installationId, `git clone of ${fullName}`, ["clone", "-q", `https://github.com/${fullName}.git`, dir]);
     },
 
     async getIssue(installationId, fullName, number) {
@@ -158,6 +172,30 @@ export function createGitHubClient(appId: string, privateKey: string): GitHub {
     async comment(installationId, fullName, number, body) {
       const token = await installationToken(installationId);
       await request(`/repos/${fullName}/issues/${number}/comments`, token, { method: "POST", body: JSON.stringify({ body }) });
+    },
+
+    async branchSha(installationId, fullName, branch) {
+      const out = await git(installationId, `git ls-remote of ${fullName}`, ["ls-remote", `https://github.com/${fullName}.git`, `refs/heads/${branch}`]);
+      return out.split("\t")[0]!.trim() || null;
+    },
+
+    async push(installationId, fullName, dir, sha, branch) {
+      await git(installationId, `git push to ${fullName} ${branch}`, ["-C", dir, "push", "-q", `https://github.com/${fullName}.git`, `${sha}:refs/heads/${branch}`]);
+    },
+
+    async findPullRequest(installationId, fullName, branch) {
+      const token = await installationToken(installationId);
+      const owner = fullName.split("/")[0];
+      const res = await request(`/repos/${fullName}/pulls?state=all&head=${encodeURIComponent(`${owner}:${branch}`)}`, token);
+      const [pr] = (await res.json()) as any[];
+      return pr ? { number: pr.number, url: pr.html_url } : null;
+    },
+
+    async createDraftPullRequest(installationId, fullName, { head, base, title, body }) {
+      const token = await installationToken(installationId);
+      const res = await request(`/repos/${fullName}/pulls`, token, { method: "POST", body: JSON.stringify({ head, base, title, body, draft: true }) });
+      const pr = (await res.json()) as any;
+      return { number: pr.number, url: pr.html_url };
     },
   };
 }
