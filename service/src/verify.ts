@@ -25,10 +25,10 @@ async function inSandbox(
   sha: string,
   setup: string,
   commands: string[],
-  timeoutMs: number,
-  overlay?: { sha: string; files: string[] },
+  opts: { timeoutMs: number; overlay?: { sha: string; files: string[] } },
 ) {
   const dir = `${workspace}-check`;
+  const { timeoutMs, overlay } = opts;
   rmSync(dir, { recursive: true, force: true });
   try {
     await $`git clone -q --no-checkout ${workspace} ${dir} && git -C ${dir} checkout -q --detach ${sha}`.quiet();
@@ -55,7 +55,7 @@ export async function redGreen(sandbox: Sandbox, workspace: string, base: string
   const files = [...new Set(testFiles)];
   const { setup_command: setup, test_file_command: template } = conventions;
   const commands = template ? files.map((f) => template.replaceAll("{file}", quote(f))) : conventions.check_commands;
-  const red = await inSandbox(sandbox, workspace, "base", base, setup, commands, timeoutMs, { sha: head, files });
+  const red = await inSandbox(sandbox, workspace, "base", base, setup, commands, { timeoutMs, overlay: { sha: head, files } });
   const result = (error: string | null, green?: typeof red): Verified => ({
     output: { runs: [...red.output, ...(green?.output ?? [])] },
     log: red.log + (green?.log ?? ""),
@@ -69,7 +69,7 @@ export async function redGreen(sandbox: Sandbox, workspace: string, base: string
   const passing = tests.find((r) => !r.exitCode);
   if (passing) return result(`tautological test: \`${passing.command}\` passes on base`);
 
-  const green = await inSandbox(sandbox, workspace, "head", head, setup, commands, timeoutMs);
+  const green = await inSandbox(sandbox, workspace, "head", head, setup, commands, { timeoutMs });
   if (green.timedOut) return result("timeout", green);
   const broken = green.runs.find((r) => r.exitCode);
   if (!broken) return result(null, green);
@@ -78,7 +78,7 @@ export async function redGreen(sandbox: Sandbox, workspace: string, base: string
 
 /** Runs setup and every check command on head; any non-zero exit fails. timeoutMs is the phase's clamped limit. */
 export async function checks(sandbox: Sandbox, workspace: string, head: string, conventions: Conventions, timeoutMs: number): Promise<Verified> {
-  const { runs, timedOut, output, log } = await inSandbox(sandbox, workspace, "head", head, conventions.setup_command, conventions.check_commands, timeoutMs);
+  const { runs, timedOut, output, log } = await inSandbox(sandbox, workspace, "head", head, conventions.setup_command, conventions.check_commands, { timeoutMs });
   const broken = runs.find((r) => r.exitCode);
   return { output: { runs: output }, log, error: timedOut ? "timeout" : broken ? failed(broken) : null };
 }

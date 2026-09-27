@@ -133,6 +133,8 @@ export async function commitChange(workspace: string, message: string): Promise<
 /**
  * A git bundle of base..HEAD, so a resumed attempt can restore the commits into a fresh checkout with their
  * original SHAs. Written after every commit, so an attempt cut off by a restart can still resume.
+ * The controller calls this on the host after gitConfigHash is verified (in stageChange or changeError),
+ * before any further agent session runs.
  */
 export async function bundleChange(workspace: string, base: string): Promise<Uint8Array> {
   const file = join(workspace, ".git/auto-solve.bundle");
@@ -147,6 +149,8 @@ export async function bundleChange(workspace: string, base: string): Promise<Uin
 /**
  * Fetches a saved bundle's commits into a fresh checkout and resets HEAD to head, the last commit it holds. The
  * bundle is thin against base, which the fresh clone still has whether or not the default branch moved.
+ * The controller calls this on the host before the first agent session runs in the attempt, so no gitConfigHash
+ * check is required.
  */
 export async function restoreBundle(workspace: string, bundle: Uint8Array, head: string) {
   const file = join(workspace, ".git/auto-solve.bundle");

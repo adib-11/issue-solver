@@ -70,14 +70,77 @@ const phaseDone = (p: SourcePhase | undefined) => p?.outcome === "ok" || p?.outc
 /** A source attempt with no saved bundle cannot restore its commits, so it resumes as a fresh brief. */
 const resumeStep = (step: ResumeStep, hasBundle: boolean): ResumeStep => (!hasBundle && RESUME_ORDER[step] > RESUME_ORDER.implement ? "brief" : step);
 
+const phaseOutput = <T>(p: SourcePhase | undefined): T | null => (p?.output ? (JSON.parse(p.output) as T) : null);
+
+/**
+ * Collects completed review rounds from the source attempt. A round completes on a clean review,
+ * a fix that fixed nothing, or a fix commit whose own checks passed; an unverified fix commit
+ * is not reused, and the loop restarts from the last verified commit.
+ */
+function collectReviewRounds(
+  phases: SourcePhase[],
+  startIndex: number,
+  fixCommits: Commit[],
+  initialHead: string | null,
+  initialChecks: CommandRuns | null,
+) {
+  let step: ResumeStep = "review";
+  const copy: SourcePhase[] = [];
+  const reused: Commit[] = [];
+  const rounds: ReviewRound[] = [];
+  let head = initialHead;
+  let checks = initialChecks;
+  let i = startIndex;
+  let fixCommitIndex = 0;
+
+  while (i < phases.length) {
+    const standards = phases[i];
+    const spec = phases[i + 1];
+    if (standards?.name !== "review/standards" || !phaseDone(standards) || spec?.name !== "review/spec" || !phaseDone(spec)) break;
+    const round: ReviewRound = { standards: phaseOutput<Reviewed>(standards)!.findings, spec: phaseOutput<Reviewed>(spec)!.findings, decisions: [] };
+    if (!round.standards.length && !round.spec.length) {
+      rounds.push(round);
+      copy.push(standards, spec);
+      step = "publish"; // a clean round ends the loop
+      break;
+    }
+    if (rounds.length + 1 >= REVIEW_ROUNDS) {
+      rounds.push(round);
+      copy.push(standards, spec);
+      step = "publish"; // the round cap leaves these findings open
+      break;
+    }
+    const fix = phases[i + 2];
+    if (fix?.name !== "fix" || !phaseDone(fix)) break;
+    round.decisions = phaseOutput<Fixed>(fix)!.decisions;
+    if (!round.decisions.some((d) => d.decision === "fixed")) {
+      rounds.push(round);
+      copy.push(standards, spec, fix);
+      step = "publish"; // a round that fixes nothing ends the loop
+      break;
+    }
+    const recheck = phases[i + 3];
+    // A fix commit that was never re-checked, or whose checks failed, is not reused; neither is its round.
+    if (recheck?.name !== "checks" || !phaseDone(recheck)) break;
+    const fixCommit = fixCommits[fixCommitIndex++];
+    if (!fixCommit) break;
+    rounds.push(round);
+    copy.push(standards, spec, fix, recheck);
+    reused.push(fixCommit);
+    head = fixCommit.sha;
+    checks = phaseOutput<CommandRuns>(recheck);
+    i += 4;
+  }
+
+  return { step, copy, reused, rounds, head, checks };
+}
+
 /**
  * Where a failed Retry resumes and what it reuses: the first pipeline step with no completed output in the source
- * attempt. A review round completes on a clean review, a fix that fixed nothing, or a fix commit whose own checks
- * passed; an unverified fix commit is not reused, and the loop restarts from the last verified commit.
+ * attempt.
  */
 function analyzePhases(commits: Commit[], phases: SourcePhase[]) {
   const find = (name: string) => phases.find((p) => p.name === name);
-  const output = <T>(p: SourcePhase | undefined): T | null => (p?.output ? (JSON.parse(p.output) as T) : null);
 
   const briefPhase = find("brief");
   const implementPhase = find("implement");
@@ -88,7 +151,7 @@ function analyzePhases(commits: Commit[], phases: SourcePhase[]) {
   let step: ResumeStep = "brief";
   const copy: SourcePhase[] = [];
   const reused: Commit[] = [];
-  const rounds: ReviewRound[] = [];
+  let rounds: ReviewRound[] = [];
   let head: string | null = null;
   let checks: CommandRuns | null = null;
 
@@ -108,57 +171,23 @@ function analyzePhases(commits: Commit[], phases: SourcePhase[]) {
   }
   if (step === "checks" && initialChecks) {
     copy.push(initialChecks);
-    checks = output<CommandRuns>(initialChecks);
-    step = "review";
-    let i = checksIdx + 1;
-    let next = 1; // commits[0] is the implement commit; the rest are the rounds' fix commits
-    while (i < phases.length) {
-      const standards = phases[i];
-      const spec = phases[i + 1];
-      if (standards?.name !== "review/standards" || !phaseDone(standards) || spec?.name !== "review/spec" || !phaseDone(spec)) break;
-      const round: ReviewRound = { standards: output<Reviewed>(standards)!.findings, spec: output<Reviewed>(spec)!.findings, decisions: [] };
-      if (!round.standards.length && !round.spec.length) {
-        rounds.push(round);
-        copy.push(standards, spec);
-        step = "publish"; // a clean round ends the loop
-        break;
-      }
-      if (rounds.length + 1 >= REVIEW_ROUNDS) {
-        rounds.push(round);
-        copy.push(standards, spec);
-        step = "publish"; // the round cap leaves these findings open
-        break;
-      }
-      const fix = phases[i + 2];
-      if (fix?.name !== "fix" || !phaseDone(fix)) break;
-      round.decisions = output<Fixed>(fix)!.decisions;
-      if (!round.decisions.some((d) => d.decision === "fixed")) {
-        rounds.push(round);
-        copy.push(standards, spec, fix);
-        step = "publish"; // a round that fixes nothing ends the loop
-        break;
-      }
-      const recheck = phases[i + 3];
-      // A fix commit that was never re-checked, or whose checks failed, is not reused; neither is its round.
-      if (recheck?.name !== "checks" || !phaseDone(recheck)) break;
-      const fixCommit = commits[next++];
-      if (!fixCommit) break;
-      rounds.push(round);
-      copy.push(standards, spec, fix, recheck);
-      reused.push(fixCommit);
-      head = fixCommit.sha;
-      checks = output<CommandRuns>(recheck);
-      i += 4;
-    }
+    checks = phaseOutput<CommandRuns>(initialChecks);
+    const reviewed = collectReviewRounds(phases, checksIdx + 1, commits.slice(1), head, checks);
+    step = reviewed.step;
+    copy.push(...reviewed.copy);
+    reused.push(...reviewed.reused);
+    rounds = reviewed.rounds;
+    head = reviewed.head;
+    checks = reviewed.checks;
   }
 
   return {
     step,
     phases: copy,
     commits: reused,
-    brief: output<Brief>(briefPhase),
-    implemented: output<Implemented>(implementPhase),
-    redGreen: output<CommandRuns>(redGreenPhase),
+    brief: phaseOutput<Brief>(briefPhase),
+    implemented: phaseOutput<Implemented>(implementPhase),
+    redGreen: phaseOutput<CommandRuns>(redGreenPhase),
     checks,
     rounds,
     head,
@@ -560,7 +589,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
       if (!rechecked) return null; // failing checks after the loop fail the attempt, with no PR
       latestChecks = rechecked;
     }
-    // Both exit paths reach here, and publishing runs git on the host: a tampered checkout's config must fail first.
+    // All exit paths reach here, and publishing runs git on the host: a tampered checkout's config must fail first.
     const edited = workspaceError(workspace, configHash);
     if (edited) {
       finish(claimed, "failed", `review: ${edited}`);
@@ -712,6 +741,8 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
         ? { rounds: plan.rounds, head: plan.head!, checks: checkRuns }
         : await reviewLoop(claimed, { configHash, change: { base: baseSha, commits }, conventions, issue, brief, checks: checkRuns, testFiles, rounds: plan?.rounds });
     if (!review) return;
+    const tampered = workspaceError(workspace, configHash);
+    if (tampered) return finish(claimed, "failed", `review: ${tampered}`);
     const body = prBody({ issue, brief, implemented, redGreen: redGreenRuns, checks: review.checks, review: review.rounds, harness: claimed.harness.label });
     await publish(claimed, repo, review.head, prTitle(issue, conventions, implemented.commit_message), body);
   }
