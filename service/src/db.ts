@@ -54,6 +54,8 @@ export function openDb(path: string) {
   addColumn("attempts", "issue", "TEXT");
   addColumn("phases", "output", "TEXT");
   addColumn("attempts", "commits", "TEXT NOT NULL DEFAULT '[]'");
+  addColumn("attempts", "branch", "TEXT");
+  addColumn("attempts", "pr_url", "TEXT");
   db.run(`CREATE TABLE IF NOT EXISTS scan_cursors (
     repo_id INTEGER PRIMARY KEY,
     scanned_at TEXT NOT NULL

@@ -37,6 +37,11 @@ export type Attempt = {
   issue: IssueSnapshot | null;
   /** The controller's commits on top of base_sha, oldest first. */
   commits: Commit[];
+  /** The branch the commits are pushed to, recorded before the push; null until publishing. */
+  branch: string | null;
+  branch_url: string | null;
+  /** The draft PR, opened or reused; null until it exists. */
+  pr_url: string | null;
   phases: Phase[];
 };
 

@@ -10,8 +10,9 @@ import { CONVENTIONS_PROMPT, CONVENTIONS_SCHEMA, CONVENTIONS_TIMEOUT_MS, convent
 import { openDb } from "./db";
 import { changeError, commitChange, gitConfigHash, IMPLEMENT_SCHEMA, IMPLEMENT_TIMEOUT_MS, type Implemented, implementError, implementPrompt } from "./implement";
 import type { GitHub, Issue, Repo } from "./github";
+import { branchFor, prBody, prTitle } from "./publish";
 import { type AuthCheckState, type Harness, type RunError, type RunOptions, schemaError, type SetupView } from "./harness";
-import { type Attempt, type Brief, type Commit, type Conventions, JOB_STATES, type IssueSnapshot, type Job, type JobDetail, NO_CHECKS, type Phase, type RepoView, TRUSTED_AUTHORS, UNTRUSTED_AUTHOR } from "./jobs";
+import { type Attempt, type Brief, type CommandRuns, type Commit, type Conventions, JOB_STATES, type IssueSnapshot, type Job, type JobDetail, NO_CHECKS, type Phase, type RepoView, TRUSTED_AUTHORS, UNTRUSTED_AUTHOR } from "./jobs";
 import type { Runner, Sandbox } from "./runner";
 import { checks, redGreen, type Verified } from "./verify";
 
@@ -33,7 +34,6 @@ type RepoRow = {
 };
 
 const LOG_LIMIT_BYTES = 200 * 1024;
-const PIPELINE_ENDS = "Pipeline ends here: the phases after checks are not built yet.";
 const INTERRUPTED = "Interrupted by a restart";
 // GitHub tokens, Claude tokens, and JWTs (Codex's ChatGPT tokens), wherever they come from; configured harness
 // credentials are redacted by value too.
@@ -185,6 +185,8 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   );
   const setBaseSha = db.query("UPDATE attempts SET base_sha = ? WHERE id = ?");
   const setIssue = db.query("UPDATE attempts SET issue = ? WHERE id = ?");
+  const setBranch = db.query("UPDATE attempts SET branch = ? WHERE id = ?");
+  const setPrUrl = db.query("UPDATE attempts SET pr_url = ? WHERE id = ?");
   const addCommit = db.query("UPDATE attempts SET commits = json_insert(commits, '$[#]', json(?)) WHERE id = ?");
   const endAttempt = db.query("UPDATE attempts SET finished_at = ?, result = ? WHERE id = ?");
   const endJob = db.query("UPDATE jobs SET state = ?, skip_reason = ?, phase = NULL, updated_at = ? WHERE id = ?");
@@ -235,8 +237,8 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     return result;
   }
 
-  /** Runs one controller phase; false when it failed the attempt. */
-  async function verifyPhase(claimed: Claimed, name: string, verify: () => Promise<Verified>) {
+  /** Runs one controller phase; null when it failed the attempt. */
+  async function verifyPhase(claimed: Claimed, name: string, verify: () => Promise<Verified>): Promise<CommandRuns | null> {
     setPhase.run(name, now(), claimed.job.id);
     const phase = startPhase.get(claimed.attemptId, name, now())!;
     let verified: Verified;
@@ -250,7 +252,51 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     const outcome = output.skipped ? "skipped" : error === "timeout" ? "timeout" : error ? "failed" : "ok";
     endPhase.run(now(), outcome, capLog(redact(log)), JSON.stringify(output), phase.id);
     if (error) finish(claimed, "failed", `${name}: ${redact(error)}`);
-    return !error;
+    return error ? null : output;
+  }
+
+  /**
+   * Pushes head to the issue's branch and opens a draft PR from it, reusing any PR the branch already has. The
+   * commits are already recorded; the branch is recorded before the push. Never forces and never writes another branch.
+   */
+  async function publish(claimed: Claimed, repo: RepoRow, head: string, title: string, body: string) {
+    const { job, attemptId, workspace } = claimed;
+    const branch = branchFor(job.issue_number);
+    const { installation_id: installation, full_name: fullName } = repo;
+    setPhase.run("publish", now(), job.id);
+    const phase = startPhase.get(attemptId, "publish", now())!;
+    const log: string[] = [];
+    const end = (outcome: string, output: object | null = null) => endPhase.run(now(), outcome, redact(log.join("\n")), output && JSON.stringify(output), phase.id);
+    try {
+      if ((await github.getIssue(installation, fullName, job.issue_number)).state === "CLOSED") {
+        end("skipped");
+        return finish(claimed, "skipped", "skipped: closed", "closed");
+      }
+      setBranch.run(branch, attemptId);
+      const remote = await github.branchSha(installation, fullName, branch);
+      if (remote && remote !== head) {
+        end("failed");
+        return finish(claimed, "failed", `publish: ${branch} is at ${remote} on the remote, not a commit of this attempt`);
+      }
+      if (!remote) {
+        await github.push(installation, fullName, workspace, head, branch);
+        log.push(`Pushed ${head} to ${branch}.`);
+      }
+      let pr = await github.findPullRequest(installation, fullName, branch);
+      if (pr) log.push(`Reused ${pr.url}.`);
+      else {
+        const base = (await $`git -C ${workspace} symbolic-ref --short HEAD`.text()).trim();
+        pr = await github.createDraftPullRequest(installation, fullName, { head: branch, base, title, body });
+        log.push(`Opened draft ${pr.url} into ${base}.`);
+      }
+      setPrUrl.run(pr.url, attemptId);
+      end("ok", { branch, pr_url: pr.url });
+      finish(claimed, "pr_created", `pr_created: ${pr.url}`);
+    } catch (err) {
+      log.push((err as Error).message);
+      end("failed");
+      finish(claimed, "failed", `publish: ${redact((err as Error).message)}`);
+    }
   }
 
   /** auth and quota pause dispatch and put the job back in the queue; other errors fail the job. */
@@ -326,9 +372,12 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     const head = await commitChange(workspace, commit_message);
     addCommit.run(JSON.stringify(head), attemptId);
 
-    if (!(await verifyPhase(claimed, "red/green", () => redGreen(sandbox, workspace, baseSha, head.sha, conventions, testFiles)))) return;
-    if (!(await verifyPhase(claimed, "checks", () => checks(sandbox, workspace, head.sha, conventions)))) return;
-    finish(claimed, "failed", PIPELINE_ENDS);
+    const redGreenRuns = await verifyPhase(claimed, "red/green", () => redGreen(sandbox, workspace, baseSha, head.sha, conventions, testFiles));
+    if (!redGreenRuns) return;
+    const checkRuns = await verifyPhase(claimed, "checks", () => checks(sandbox, workspace, head.sha, conventions));
+    if (!checkRuns) return;
+    const body = prBody({ issue, brief, implemented: implemented.output as Implemented, redGreen: redGreenRuns, checks: checkRuns, harness: claimed.harness.label });
+    await publish(claimed, repo, head.sha, prTitle(issue, conventions, commit_message), body);
   }
 
   /** Claims the oldest queued job and runs one attempt of it; false when there is nothing to do. */
@@ -392,8 +441,8 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   });
 
   type Stored<T, K extends keyof T> = Omit<T, K> & { [P in K]: string | null };
-  const listAttempts = db.query<Stored<Omit<Attempt, "phases">, "issue" | "commits">, [number]>(
-    "SELECT id, harness, base_sha, started_at, finished_at, result, issue, commits FROM attempts WHERE job_id = ? ORDER BY id",
+  const listAttempts = db.query<Stored<Omit<Attempt, "phases" | "branch_url">, "issue" | "commits">, [number]>(
+    "SELECT id, harness, base_sha, started_at, finished_at, result, issue, commits, branch, pr_url FROM attempts WHERE job_id = ? ORDER BY id",
   );
   const listPhases = db.query<Stored<Phase, "output">, [number]>(
     "SELECT name, started_at, finished_at, outcome, log, output FROM phases WHERE attempt_id = ? ORDER BY id",
@@ -405,6 +454,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
       ...a,
       issue: parse<IssueSnapshot>(a.issue),
       commits: parse<Commit[]>(a.commits)!,
+      branch_url: a.branch && `https://github.com/${job.repo_full_name}/tree/${a.branch}`,
       phases: listPhases.all(a.id).map((p) => ({ ...p, output: parse(p.output) })),
     }));
     return c.json({ ...job, attempts } satisfies JobDetail);

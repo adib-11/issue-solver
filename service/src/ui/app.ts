@@ -137,6 +137,12 @@ function renderAttempt(attempt: JobDetail["attempts"][number], number: number) {
     `Attempt ${number} (${attempt.harness})`,
     el("p", { class: "text-sm text-slate-600" }, "Started ", time(attempt.started_at), ...(attempt.finished_at ? [", finished ", time(attempt.finished_at)] : [])),
     el("p", { class: "my-2 break-words", textContent: attempt.result ?? "Running…" }),
+    ...[
+      ["Pull request", attempt.pr_url],
+      ["Branch", attempt.branch_url],
+    ].map(([label, href]) =>
+      href ? el("p", { class: "my-1 break-words" }, `${label}: `, el("a", { href, rel: "noreferrer", class: `text-blue-700 underline ${focusRing}`, textContent: href })) : null,
+    ),
     brief ? el("div", { class: "border-t border-slate-200 py-2" }, renderBrief(brief)) : null,
     ...attempt.commits.map((commit) =>
       el(

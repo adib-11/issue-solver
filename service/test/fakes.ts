@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { createApp } from "../src/app";
 import type { Clock } from "../src/clock";
 import type { Config } from "../src/config";
-import type { GitHub, Installation, Issue, Repo } from "../src/github";
+import type { GitHub, Installation, Issue, PullRequest, Repo } from "../src/github";
 import type { IssueComment } from "../src/jobs";
 import type { AuthState, Harness, RunOptions, RunResult } from "../src/harness";
 import type { Runner, Sandbox, SandboxRun } from "../src/runner";
@@ -64,6 +64,37 @@ export class FakeGitHub implements GitHub {
 
   async comment(installationId: number, fullName: string, number: number, body: string) {
     this.calls.push({ op: "comment", args: [installationId, fullName, number, body] });
+  }
+
+  /** Pull requests on the fake remotes, open or not. */
+  pulls: (PullRequest & { fullName: string; head: string; base: string; title: string; body: string; draft: boolean })[] = [];
+  /** Runs before each push reaches the remote. */
+  beforePush?: () => Promise<void> | void;
+
+  async branchSha(installationId: number, fullName: string, branch: string) {
+    this.calls.push({ op: "branchSha", args: [installationId, fullName, branch] });
+    const out = (await $`git ls-remote ${this.remotes.get(fullName)!} refs/heads/${branch}`.text()).trim();
+    return out ? out.split("\t")[0]! : null;
+  }
+
+  async push(installationId: number, fullName: string, dir: string, sha: string, branch: string) {
+    this.calls.push({ op: "push", args: [installationId, fullName, sha, branch] });
+    await this.beforePush?.();
+    await $`git -C ${dir} push -q ${this.remotes.get(fullName)!} ${sha}:refs/heads/${branch}`;
+  }
+
+  async findPullRequest(installationId: number, fullName: string, branch: string) {
+    this.calls.push({ op: "findPullRequest", args: [installationId, fullName, branch] });
+    const pr = this.pulls.find((p) => p.fullName === fullName && p.head === branch);
+    return pr ? { number: pr.number, url: pr.url } : null;
+  }
+
+  async createDraftPullRequest(installationId: number, fullName: string, pr: { head: string; base: string; title: string; body: string }) {
+    this.calls.push({ op: "createDraftPullRequest", args: [installationId, fullName, pr] });
+    const number = 100 + this.pulls.length;
+    const created = { number, url: `https://github.com/${fullName}/pull/${number}`, fullName, draft: true, ...pr };
+    this.pulls.push(created);
+    return { number, url: created.url };
   }
 
   sinceArgs() {

@@ -102,23 +102,24 @@ describe("worker", () => {
     expect(existsSync(run!.workspace)).toBe(false);
   });
 
-  test("records the attempt and its phases, then stops with the pipeline-ends-here reason", async () => {
+  test("records the attempt and its phases, through publishing", async () => {
     const { harness } = await ready();
     harness.script = [discovered(), ...solved()];
     await t.app.work();
     const job = await jobFor(1);
-    expect(job).toMatchObject({ state: "failed", phase: null });
+    expect(job).toMatchObject({ state: "pr_created", phase: null });
     expect(job.attempts).toMatchObject([
       {
         harness: "claude-code",
         base_sha: expect.stringMatching(/^[0-9a-f]{40}$/),
-        result: expect.stringContaining("Pipeline ends here"),
+        result: expect.stringMatching(/^pr_created: /),
         phases: [
           { name: "conventions", outcome: "ok", log: "discovery log" },
           { name: "brief", outcome: "ok", log: "brief log" },
           { name: "implement", outcome: "ok", log: "implement log" },
           { name: "red/green", outcome: "ok" },
           { name: "checks", outcome: "ok" },
+          { name: "publish", outcome: "ok" },
         ],
       },
     ]);
@@ -136,7 +137,7 @@ describe("worker", () => {
     expect((await jobFor(2)).state).toBe("queued");
     release();
     await working;
-    expect([(await jobFor(1)).state, (await jobFor(2)).state]).toEqual(["failed", "failed"]);
+    expect([(await jobFor(1)).state, (await jobFor(2)).state]).toEqual(["pr_created", "pr_created"]);
   });
 
   test("dispatches nothing until a harness is chosen", async () => {
@@ -152,11 +153,11 @@ describe("worker", () => {
     const { harness } = await ready();
     harness.script = [discovered(), ...solved(), ...solved()];
     await t.app.start();
-    await until(async () => (await jobFor(1)).state === "failed");
+    await until(async () => (await jobFor(1)).state === "pr_created");
     await t.app.work();
     t.github.issues.get(1)!.push(issue(2, { updatedAt: "2026-01-01T00:00:30Z" }));
     await t.clock.advance(60_000);
-    expect((await jobFor(2)).state).toBe("failed");
+    expect((await jobFor(2)).state).toBe("pr_created");
   });
 });
 
@@ -166,7 +167,7 @@ describe("conventions", () => {
     harness.script = [discovered(), ...solved(), ...solved()];
     await t.app.work();
     expect(harness.runs.filter((r) => r.prompt === CONVENTIONS_PROMPT)).toHaveLength(1);
-    expect((await jobFor(2)).attempts[0].phases.map((p: any) => p.name)).toEqual(["brief", "implement", "red/green", "checks"]);
+    expect((await jobFor(2)).attempts[0].phases.map((p: any) => p.name)).toEqual(["brief", "implement", "red/green", "checks", "publish"]);
     expect(await t.json("/api/repos")).toEqual([
       { id: 1, full_name: "octo/app", discovered: CONVENTIONS, discovered_at: "2026-01-01T00:00:00.000Z", override: null },
     ]);
@@ -216,7 +217,7 @@ describe("conventions", () => {
     expect((await t.post("/api/repos/1/override", null, "PUT")).status).toBe(200);
     await addIssue(3);
     await t.app.work();
-    expect((await jobFor(3)).attempts[0].result).toContain("Pipeline ends here");
+    expect((await jobFor(3)).attempts[0].result).toStartWith("pr_created: ");
   });
 
   test("an override is used without discovering first", async () => {
@@ -224,7 +225,7 @@ describe("conventions", () => {
     await t.post("/api/repos/1/override", CONVENTIONS, "PUT");
     harness.script = [...solved()];
     await t.app.work();
-    expect((await jobFor(1)).attempts[0]).toMatchObject({ result: expect.stringContaining("Pipeline ends here"), phases: [{ name: "brief" }, { name: "implement" }, { name: "red/green" }, { name: "checks" }] });
+    expect((await jobFor(1)).attempts[0]).toMatchObject({ result: expect.stringMatching(/^pr_created: /), phases: [{ name: "brief" }, { name: "implement" }, { name: "red/green" }, { name: "checks" }, { name: "publish" }] });
   });
 
   test("an invalid override is refused, as is an unknown repo", async () => {
@@ -259,7 +260,7 @@ describe("harness errors", () => {
       await t.post("/api/setup/test-auth");
       harness.script = [discovered(), ...solved(), ...solved()];
       await t.app.work();
-      expect([(await jobFor(1)).state, (await jobFor(2)).state]).toEqual(["failed", "failed"]);
+      expect([(await jobFor(1)).state, (await jobFor(2)).state]).toEqual(["pr_created", "pr_created"]);
     });
   }
 
@@ -270,7 +271,7 @@ describe("harness errors", () => {
       await t.app.work();
       expect(await jobFor(1)).toMatchObject({ state: "failed", attempts: [{ result: `conventions: ${error}` }] });
       expect((await t.json("/api/setup")).paused).toBeNull();
-      expect((await jobFor(2)).attempts[0].result).toContain("Pipeline ends here");
+      expect((await jobFor(2)).attempts[0].result).toStartWith("pr_created: ");
     });
   }
 
@@ -308,7 +309,7 @@ test("a restart fails the interrupted attempt and cleans up runners, so the queu
   expect(existsSync(harness.runs[0]!.workspace)).toBe(false);
   await t.app.work();
   expect(harness.runs).toHaveLength(4);
-  expect((await jobFor(2)).attempts[0].result).toContain("Pipeline ends here");
+  expect((await jobFor(2)).attempts[0].result).toStartWith("pr_created: ");
 });
 
 describe("brief", () => {
@@ -357,8 +358,8 @@ describe("brief", () => {
     harness.script = [discovered(), ...solved()];
     await t.app.work();
     const job = await jobFor(1);
-    expect(job.state).toBe("failed");
-    expect(job.attempts[0].result).toContain("Pipeline ends here");
+    expect(job.state).toBe("pr_created");
+    expect(job.attempts[0].result).toStartWith("pr_created: ");
     expect(job.attempts[0].phases[1]).toMatchObject({ name: "brief", outcome: "ok", output: BRIEF });
   });
 
@@ -418,7 +419,7 @@ describe("brief", () => {
     const job = await jobFor(1);
     expect(job.attempts).toHaveLength(2);
     expect(job.attempts[1].issue.body).toBe("Clarified: the /users endpoint returns 500.");
-    expect(job.attempts[1].phases.map((p: any) => p.name)).toEqual(["brief", "implement", "red/green", "checks"]);
+    expect(job.attempts[1].phases.map((p: any) => p.name)).toEqual(["brief", "implement", "red/green", "checks", "publish"]);
     expect(harness.runs[2]!.prompt).toContain("Clarified: the /users endpoint returns 500.");
     expect((await t.post(`/api/jobs/${id}/retry`)).status).toBe(409);
   });
@@ -472,7 +473,7 @@ describe("implement", () => {
     harness.script = [discovered(), briefed(), implemented()];
     await t.app.work();
     const attempt = (await jobFor(1)).attempts[0];
-    expect(attempt.result).toContain("Pipeline ends here");
+    expect(attempt.result).toStartWith("pr_created: ");
     expect(attempt.phases[2]).toMatchObject({ name: "implement", outcome: "ok", output: IMPLEMENTED });
     expect(attempt.commits).toEqual([
       {
@@ -497,7 +498,7 @@ describe("implement", () => {
     ];
     await t.app.work();
     const { commits, result } = (await jobFor(1)).attempts[0];
-    expect(result).toContain("Pipeline ends here");
+    expect(result).toStartWith("pr_created: ");
     expect(commits).toMatchObject([{ message: "Make f handle 1", stat: expect.stringContaining("2 files changed") }]);
   });
 
@@ -544,7 +545,7 @@ describe("implement", () => {
     harness.script = [discovered({ ...CONVENTIONS, has_tests: false, test_file_command: "" }), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] })];
     await t.app.work();
     const { result, commits } = (await jobFor(1)).attempts[0];
-    expect(result).toContain("Pipeline ends here");
+    expect(result).toStartWith("pr_created: ");
     expect(commits).toHaveLength(1);
   });
 
@@ -574,7 +575,7 @@ describe("red/green and checks", () => {
     harness.script = [discovered(), ...solved()];
     await t.app.work();
     const attempt = (await jobFor(1)).attempts[0];
-    expect(attempt.result).toContain("Pipeline ends here");
+    expect(attempt.result).toStartWith("pr_created: ");
     expect(phase(attempt, "red/green")).toMatchObject({
       outcome: "ok",
       output: {
@@ -624,7 +625,7 @@ describe("red/green and checks", () => {
       },
     ];
     await t.app.work();
-    expect((await jobFor(1)).attempts[0].result).toContain("Pipeline ends here");
+    expect((await jobFor(1)).attempts[0].result).toStartWith("pr_created: ");
     expect(seen).toEqual(new Set(["no src/f.ts, scratch: false", `${CHANGE["src/f.ts"].trim()}, scratch: false`]));
   });
 
@@ -665,7 +666,7 @@ describe("red/green and checks", () => {
     harness.script = [discovered({ ...CONVENTIONS, test_file_command: "" }), ...solved()];
     await t.app.work();
     const attempt = (await jobFor(1)).attempts[0];
-    expect(attempt.result).toContain("Pipeline ends here");
+    expect(attempt.result).toStartWith("pr_created: ");
     expect(phase(attempt, "red/green").output.runs).toEqual([
       { on: "base", command: "bun install", exit_code: 0 },
       { on: "base", command: "bun test", exit_code: 0 },
@@ -687,7 +688,7 @@ describe("red/green and checks", () => {
     harness.script = [discovered(noTests), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] })];
     await t.app.work();
     const attempt = (await jobFor(1)).attempts[0];
-    expect(attempt.result).toContain("Pipeline ends here");
+    expect(attempt.result).toStartWith("pr_created: ");
     expect(phase(attempt, "red/green")).toMatchObject({ outcome: "skipped", output: { runs: [], skipped: expect.stringContaining("no tests") } });
     expect(phase(attempt, "checks").outcome).toBe("ok");
   });
@@ -715,7 +716,7 @@ describe("red/green and checks", () => {
     harness.script = [discovered(), ...solved()];
     await t.app.work();
     const attempt = (await jobFor(1)).attempts[0];
-    expect(attempt.result).toContain("Pipeline ends here");
+    expect(attempt.result).toStartWith("pr_created: ");
     expect(phase(attempt, "red/green").output.runs).toEqual([
       { on: "base", command: "bun install", exit_code: 2 },
       { on: "head", command: "bun install", exit_code: 0 },
@@ -753,5 +754,132 @@ describe("red/green and checks", () => {
     const attempt = (await jobFor(1)).attempts[0];
     expect(attempt.result).toBe("checks: timeout");
     expect(phase(attempt, "checks").outcome).toBe("timeout");
+  });
+});
+
+describe("publish", () => {
+  const remoteSha = async (remote: string, ref: string) => (await $`git -C ${remote} rev-parse ${ref}`.text()).trim();
+
+  test("a verified attempt is pushed to agent/issue-N and opened as one draft PR; the job becomes pr_created with PR and branch links", async () => {
+    const { harness, remote } = await ready();
+    const main = await remoteSha(remote, "main");
+    harness.script = [discovered(), ...solved()];
+    await t.app.work();
+    const job = await jobFor(1);
+    const attempt = job.attempts[0];
+    expect(job.state).toBe("pr_created");
+    expect(attempt).toMatchObject({
+      result: "pr_created: https://github.com/octo/app/pull/100",
+      branch: "agent/issue-1",
+      branch_url: "https://github.com/octo/app/tree/agent/issue-1",
+      pr_url: "https://github.com/octo/app/pull/100",
+    });
+    expect(attempt.phases.at(-1)).toMatchObject({ name: "publish", outcome: "ok" });
+    expect(await remoteSha(remote, "agent/issue-1")).toBe(attempt.commits[0].sha);
+    expect(await remoteSha(remote, "main")).toBe(main);
+    expect(t.github.pulls).toMatchObject([{ fullName: "octo/app", head: "agent/issue-1", base: "main", draft: true, title: "Make f handle 1" }]);
+    // No auto-merge, approvals, or reviewer requests: the controller has no such operations to call.
+    expect(new Set(t.github.calls.map((c) => c.op))).toEqual(
+      new Set(["listInstallations", "listInstallationRepos", "listIssues", "checkout", "getIssue", "branchSha", "push", "findPullRequest", "createDraftPullRequest"]),
+    );
+  });
+
+  test("the PR body lets the owner review without the dashboard", async () => {
+    const { harness } = await ready();
+    harness.script = [discovered(), ...solved()];
+    await t.app.work();
+    const { body } = t.github.pulls[0]!;
+    expect(body).toStartWith("Closes #1\n");
+    for (const part of [
+      "f now handles 1",
+      "- [ ] `f(1)` returns 2",
+      "- [ ] `f(0)` throws",
+      "- `f`: its return value, through the existing unit tests",
+      "- `test/f.test.ts`: f(1) returns 2",
+      "`bun test test/f.test.ts` on the base with the new tests: exit 1",
+      "`bun test test/f.test.ts` on the change: exit 0",
+      "`bun run typecheck`: exit 0",
+      "Label of claude-code",
+      "AI-generated",
+    ]) {
+      expect(body).toContain(part);
+    }
+  });
+
+  test("a repo without tests says so in the PR body", async () => {
+    const { harness } = await ready();
+    harness.script = [discovered({ ...CONVENTIONS, has_tests: false, test_file_command: "" }), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] })];
+    await t.app.work();
+    expect(t.github.pulls[0]!.body).toContain("the repo has no tests");
+  });
+
+  test("the title falls back to Fix #N: <issue title> when the repo has no commit style", async () => {
+    const { harness } = await ready();
+    harness.script = [discovered({ ...CONVENTIONS, commit_style: "" }), ...solved()];
+    await t.app.work();
+    expect(t.github.pulls[0]!.title).toBe("Fix #1: Issue 1");
+  });
+
+  test("the commits and branch are recorded before the push", async () => {
+    const { harness } = await ready();
+    let seen: any;
+    t.github.beforePush = async () => {
+      seen = (await jobFor(1)).attempts[0];
+    };
+    harness.script = [discovered(), ...solved()];
+    await t.app.work();
+    expect(seen.commits).toHaveLength(1);
+    expect(seen.branch).toBe("agent/issue-1");
+  });
+
+  test("an issue closed before publishing is skipped: closed, with nothing pushed", async () => {
+    const { harness } = await ready();
+    harness.script = [
+      discovered(),
+      briefed(),
+      (options) => {
+        t.github.issues.get(1)![0]!.state = "CLOSED";
+        return implemented()(options);
+      },
+    ];
+    await t.app.work();
+    expect(await jobFor(1)).toMatchObject({ state: "skipped", skip_reason: "closed" });
+    expect(t.github.calls.some((c) => c.op === "push" || c.op === "createDraftPullRequest")).toBe(false);
+  });
+
+  test("an existing PR for the branch, even a closed one, is reused instead of opening another", async () => {
+    const { harness } = await ready();
+    t.github.pulls.push({ number: 7, url: "https://github.com/octo/app/pull/7", fullName: "octo/app", head: "agent/issue-1", base: "main", title: "old", body: "", draft: true });
+    harness.script = [discovered(), ...solved()];
+    await t.app.work();
+    expect(t.github.calls.find((c) => c.op === "findPullRequest")?.args).toEqual([10, "octo/app", "agent/issue-1"]);
+    expect(t.github.pulls).toHaveLength(1);
+    expect(await jobFor(1)).toMatchObject({ state: "pr_created", attempts: [{ pr_url: "https://github.com/octo/app/pull/7" }] });
+  });
+
+  test("an unexpected SHA on the remote branch fails the attempt; the branch is not touched", async () => {
+    const { harness, remote } = await ready();
+    await $`git -C ${remote} branch agent/issue-1`;
+    const theirs = await remoteSha(remote, "agent/issue-1");
+    harness.script = [discovered(), ...solved()];
+    await t.app.work();
+    const job = await jobFor(1);
+    expect(job.state).toBe("failed");
+    expect(job.attempts[0].result).toBe(`publish: agent/issue-1 is at ${theirs} on the remote, not a commit of this attempt`);
+    expect(await remoteSha(remote, "agent/issue-1")).toBe(theirs);
+    expect(t.github.pulls).toHaveLength(0);
+  });
+
+  test("a GitHub error while publishing fails the attempt naming the phase", async () => {
+    const { harness } = await ready();
+    t.github.beforePush = () => {
+      throw new Error("GitHub 502");
+    };
+    harness.script = [discovered(), ...solved()];
+    await t.app.work();
+    const job = await jobFor(1);
+    expect(job.state).toBe("failed");
+    expect(job.attempts[0].result).toBe("publish: GitHub 502");
+    expect(job.attempts[0].phases.at(-1)).toMatchObject({ name: "publish", outcome: "failed" });
   });
 });
