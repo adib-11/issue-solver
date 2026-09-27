@@ -69,5 +69,9 @@ export function openDb(path: string) {
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   )`);
+  db.run(`CREATE TABLE IF NOT EXISTS deliveries (
+    guid TEXT PRIMARY KEY,
+    delivered_at TEXT NOT NULL
+  )`);
   return db;
 }

@@ -46,3 +46,18 @@ test("the Claude Code token is optional and trimmed", () => {
 test("Codex keeps its login on the codex volume at /codex by default", () => {
   expect(loadConfig(full)).toMatchObject({ codexHome: "/codex", codexVolume: "auto-solve-codex" });
 });
+
+test("publicUrl and webhookSecret are optional and trimmed", () => {
+  expect(loadConfig(full).publicUrl).toBeUndefined();
+  expect(loadConfig(full).webhookSecret).toBeUndefined();
+  expect(
+    loadConfig({
+      ...full,
+      PUBLIC_URL: " https://solve.example.com/api/webhook \n",
+      WEBHOOK_SECRET: " whsec_123 \n",
+    }),
+  ).toMatchObject({
+    publicUrl: "https://solve.example.com/api/webhook",
+    webhookSecret: "whsec_123",
+  });
+});

@@ -1,4 +1,5 @@
 import { $ } from "bun";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Hono } from "hono";
@@ -244,6 +245,9 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   const getJob = db.query<Job, [number]>("SELECT * FROM jobs WHERE id = ?");
   const upsertRepo = db.query(`INSERT INTO repos (id, full_name, installation_id) VALUES (?, ?, ?)
     ON CONFLICT (id) DO UPDATE SET full_name = excluded.full_name, installation_id = excluded.installation_id`);
+  const getDelivery = db.query<{ guid: string }, [string]>("SELECT guid FROM deliveries WHERE guid = ?");
+  const insertDelivery = db.query("INSERT INTO deliveries (guid, delivered_at) VALUES (?, ?)");
+  const getJobByRepoAndNumber = db.query<Job, [number, number]>("SELECT * FROM jobs WHERE repo_id = ? AND issue_number = ?");
 
   const getSettingQuery = db.query<{ value: string }, [string]>("SELECT value FROM settings WHERE key = ?");
   const getSetting = <T>(key: string): T | null => {
@@ -848,17 +852,145 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   }
 
   const http = new Hono();
-  http.use(basicAuth({ username: "admin", password: config.adminPassword }));
+  const webhooksEnabled = Boolean(config.publicUrl && config.webhookSecret);
+  const webhookPaths = ["/api/webhook", "/webhook"];
+
+  http.use(async (c, next) => {
+    if (webhookPaths.includes(c.req.path)) {
+      if (!webhooksEnabled) return c.json({ error: "Not found" }, 404);
+      return next();
+    }
+    return basicAuth({ username: "admin", password: config.adminPassword })(c, next);
+  });
   http.use(async (c, next) => {
     await reconciling;
     await next();
   });
   http.use(async (c, next) => {
+    if (webhookPaths.includes(c.req.path)) return next();
     if (c.req.method !== "GET" && c.req.method !== "HEAD" && c.req.header("origin") !== new URL(c.req.url).origin) {
       return c.json({ error: "Origin does not match" }, 403);
     }
     await next();
   });
+
+  const WEBHOOK_BODY_LIMIT = 1024 * 1024;
+  if (webhooksEnabled) {
+    const handleWebhook = async (c: any) => {
+      const contentLength = Number(c.req.header("content-length"));
+      if (contentLength > WEBHOOK_BODY_LIMIT) {
+        return c.json({ error: "Payload too large" }, 413);
+      }
+      const rawBuffer = Buffer.from(await c.req.arrayBuffer());
+      if (rawBuffer.byteLength > WEBHOOK_BODY_LIMIT) {
+        return c.json({ error: "Payload too large" }, 413);
+      }
+
+      const sig = c.req.header("x-hub-signature-256");
+      if (!sig || !config.webhookSecret) {
+        return c.json({ error: "Unauthorized" }, 401);
+      }
+      const computed = `sha256=${createHmac("sha256", config.webhookSecret).update(rawBuffer).digest("hex")}`;
+      const sigBuf = Buffer.from(sig);
+      const compBuf = Buffer.from(computed);
+      if (sigBuf.length !== compBuf.length || !timingSafeEqual(sigBuf, compBuf)) {
+        return c.json({ error: "Unauthorized" }, 401);
+      }
+
+      let payload: any;
+      try {
+        payload = JSON.parse(rawBuffer.toString("utf8"));
+      } catch {
+        return c.json({ error: "Malformed JSON" }, 400);
+      }
+
+      const guid = c.req.header("x-github-delivery");
+      if (!guid) {
+        return c.json({ error: "Missing X-GitHub-Delivery header" }, 400);
+      }
+      if (getDelivery.get(guid)) {
+        return c.body(null, 204);
+      }
+
+      const event = c.req.header("x-github-event");
+      if (event !== "issues" || payload?.action !== "opened") {
+        return c.body(null, 204);
+      }
+
+      const repo = payload.repository;
+      const installation = payload.installation;
+      const owner = repo?.owner;
+      if (!installation?.id || !owner || owner.type !== "User" || owner.login?.toLowerCase() !== config.ownerLogin.toLowerCase()) {
+        return c.body(null, 204);
+      }
+      if (repo.fork || repo.archived) {
+        return c.body(null, 204);
+      }
+
+      const rawIssue = payload.issue;
+      if (!rawIssue || typeof rawIssue.number !== "number") {
+        return c.json({ error: "Malformed issue payload" }, 400);
+      }
+
+      if (getJobByRepoAndNumber.get(repo.id, rawIssue.number)) {
+        return c.body(null, 204);
+      }
+
+      const assigneesCount =
+        typeof rawIssue.assignees?.totalCount === "number"
+          ? rawIssue.assignees.totalCount
+          : Array.isArray(rawIssue.assignees)
+          ? rawIssue.assignees.length
+          : 0;
+
+      const closedByPr =
+        rawIssue.closedByPullRequestsReferences ??
+        rawIssue.closed_by_pull_requests_references ??
+        { nodes: [] };
+
+      const timelineItems =
+        rawIssue.timelineItems ??
+        rawIssue.timeline_items ??
+        { nodes: [] };
+
+      const authorAssociation =
+        rawIssue.authorAssociation ??
+        rawIssue.author_association ??
+        "NONE";
+
+      const issueObj: Issue = {
+        number: rawIssue.number,
+        title: rawIssue.title ?? `Issue ${rawIssue.number}`,
+        url: rawIssue.html_url ?? rawIssue.url ?? `https://github.com/${repo.full_name}/issues/${rawIssue.number}`,
+        state: (rawIssue.state?.toUpperCase() === "CLOSED" ? "CLOSED" : "OPEN") as "OPEN" | "CLOSED",
+        authorAssociation,
+        createdAt: rawIssue.created_at ?? rawIssue.createdAt ?? now(),
+        updatedAt: rawIssue.updated_at ?? rawIssue.updatedAt ?? now(),
+        assignees: { totalCount: assigneesCount },
+        closedByPullRequestsReferences: closedByPr,
+        timelineItems,
+      };
+
+      const reason = issueObj.state === "CLOSED" ? "closed" : candidateSkipReason(issueObj);
+      const skip = reason ?? (TRUSTED_AUTHORS.includes(issueObj.authorAssociation) ? null : UNTRUSTED_AUTHOR);
+      const state = skip ? "skipped" : "queued";
+      const at = now();
+
+      db.transaction(() => {
+        insertDelivery.run(guid, at);
+        upsertRepo.run(repo.id, repo.full_name, installation.id);
+        insertJob.run(repo.id, repo.full_name, issueObj.number, issueObj.title, issueObj.url, state, skip, at, at);
+      })();
+
+      if (state === "queued") {
+        void work();
+      }
+
+      return c.json({ ok: true }, 202);
+    };
+    http.post("/api/webhook", handleWebhook);
+    http.post("/webhook", handleWebhook);
+  }
 
   http.get("/api/jobs", (c) => {
     const state = c.req.query("state");

@@ -13,6 +13,8 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       COMMENT_QUESTIONS: ${COMMENT_QUESTIONS:-false}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
       RUNNER_IMAGE: auto-solve-runner:local
       WORKSPACE_VOLUME: auto-solve-workspaces
       CODEX_HOME: /codex
