@@ -76,6 +76,7 @@ export class FakeHarness implements Harness {
   loginHelp: string;
   authState: AuthState | "error" = "ok";
   authChecks = 0;
+  authLog = "";
   constructor(
     public name: string,
     public credential?: string,
@@ -86,7 +87,7 @@ export class FakeHarness implements Harness {
 
   async checkAuth() {
     this.authChecks++;
-    return { state: this.authState, log: `${this.name} auth: ${this.authState}` };
+    return { state: this.authState, log: `${this.name} auth: ${this.authState}${this.authLog}` };
   }
 
   /** Scripted runs, answered in order; each sees the options, and the workspace while it still exists. */

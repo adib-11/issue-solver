@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { codex } from "../src/codex";
@@ -22,7 +22,7 @@ function replaying(recording: string, loggedIn = true) {
   const workspace = join(dir, "work");
   mkdirSync(join(workspace, ".git"), { recursive: true });
   mkdirSync(home);
-  if (loggedIn) writeFileSync(join(home, "auth.json"), "{}", { mode: 0o600 });
+  if (loggedIn) writeFileSync(join(home, "auth.json"), "{}", { mode: 0o644 });
   const capture = join(dir, "capture.json");
   const command = [process.execPath, join(import.meta.dir, "fake-cli.ts"), join(import.meta.dir, "recordings/codex", `${recording}.json`), capture];
   const harness = codex({ home, command });
@@ -74,6 +74,7 @@ test("logs in with the ChatGPT file credentials in its Codex home only: no API k
     expect(cli.env.CODEX_API_KEY).toBeUndefined();
     expect(configs(cli.args)).toEqual(expect.arrayContaining(['cli_auth_credentials_store="file"', 'forced_login_method="chatgpt"']));
     expect(cli.args).toContain("--ignore-user-config");
+    expect(statSync(join(home, "auth.json")).mode & 0o777).toBe(0o600);
   } finally {
     delete process.env.OPENAI_API_KEY;
     delete process.env.CODEX_API_KEY;
@@ -106,6 +107,14 @@ test("an auth failure is auth", async () => {
   const result = await replaying("auth-failed").run();
   expect(result).toMatchObject({ ok: false, error: "auth" });
   expect(result.log).toContain("refresh token has expired");
+});
+
+test("a usage limit message without a status code is quota too", async () => {
+  expect(await replaying("usage-limit-no-status").run()).toMatchObject({ ok: false, error: "quota" });
+});
+
+test("only Codex's own error lines decide the error: a 429 or 401 in the issue text or test output does not", async () => {
+  expect(await replaying("crash-quoting-errors").run()).toMatchObject({ ok: false, error: "crash" });
 });
 
 test("any other failure is a crash", async () => {

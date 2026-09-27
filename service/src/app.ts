@@ -437,7 +437,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     const harness = harnesses.find((h) => h.name === getSetting("harness"));
     if (!harness) return c.json({ error: "Choose a harness first" }, 409);
     const { state, log } = await harness.checkAuth();
-    setSetting("auth", { state, checkedAt: iso(clock.now()), log });
+    setSetting("auth", { state, checkedAt: iso(clock.now()), log: capLog(redact(log)) });
     const pause = PAUSE_REASONS[state];
     if (state === "ok") deleteSetting("paused");
     else if (pause) setSetting("paused", pause);

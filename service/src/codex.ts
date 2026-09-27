@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Harness, type RunOptions, type RunResult, runCli, schemaError } from "./harness";
@@ -9,6 +9,9 @@ const AUTH_CHECK_TIMEOUT_MS = 120_000;
 const SCHEMA_FILE = ".git/auto-solve-output-schema.json";
 // Set on every run and login, as OpenAI's CI/CD guidance for ChatGPT login asks: credentials live in auth.json only.
 const AUTH_CONFIG = ['cli_auth_credentials_store="file"', 'forced_login_method="chatgpt"'];
+// Matched only against Codex's own error lines: stderr also echoes the prompt (the issue text) and command output.
+const ERROR_LINE = /^(ERROR:|stream error)/;
+const QUOTA_FAILURE = /\b429\b|usage limit/i;
 const AUTH_FAILURE = /\b401\b|unauthorized|not logged in|log ?in again|sign in again|refresh token|token (has )?expired|forced_login_method/i;
 
 const LOGIN_HELP = `Codex runs on your ChatGPT subscription, logged in once with a device code. It never uses an API key.
@@ -29,6 +32,8 @@ The login is saved as auth.json (mode 0600) on the auto-solve-codex volume and r
 export function codex(options: { home: string; command?: string[] }): Harness {
   const { home, command = ["codex"] } = options;
   // A refresh rewrites auth.json in place, so two runs at once could each spend the same refresh token.
+  // ponytail: per-process queue; Test auth waits behind a running phase, and a timed-out runner container keeps
+  // running until the attempt's runner cleanup. Stop the container on timeout if that gap ever matters.
   let turn: Promise<unknown> = Promise.resolve();
   const oneAtATime = <T>(fn: () => Promise<T>): Promise<T> => {
     const next = turn.then(fn, fn);
@@ -37,7 +42,9 @@ export function codex(options: { home: string; command?: string[] }): Harness {
   };
 
   async function runOnce({ prompt, schema, workspace, timeoutMs, wrap = [] }: RunOptions): Promise<RunResult> {
-    if (!existsSync(join(home, "auth.json"))) return { ok: false, error: "auth", log: `Codex is not logged in: no auth.json in ${home}.` };
+    const authFile = join(home, "auth.json");
+    if (!existsSync(authFile)) return { ok: false, error: "auth", log: `Codex is not logged in: no auth.json in ${home}.` };
+    chmodSync(authFile, 0o600);
     mkdirSync(join(workspace, ".git"), { recursive: true });
     writeFileSync(join(workspace, SCHEMA_FILE), JSON.stringify(schema));
     const args = [
@@ -59,8 +66,10 @@ export function codex(options: { home: string; command?: string[] }): Harness {
     // Codex streams its activity to stderr and prints only the final message to stdout.
     const log = `${stderr}\n--- final message ---\n${stdout}`;
     if (exitCode !== 0) {
-      if (/\b429\b/.test(stderr)) return { ok: false, error: "quota", log };
-      return { ok: false, error: AUTH_FAILURE.test(stderr) ? "auth" : "crash", log };
+      // A 429 the CLI retried past on a successful run does not count.
+      const errors = stderr.split("\n").filter((line) => ERROR_LINE.test(line)).join("\n");
+      if (QUOTA_FAILURE.test(errors)) return { ok: false, error: "quota", log };
+      return { ok: false, error: AUTH_FAILURE.test(errors) ? "auth" : "crash", log };
     }
     let output: unknown;
     try {

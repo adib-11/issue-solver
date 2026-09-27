@@ -365,6 +365,13 @@ describe("harness setup", () => {
     expect((await t.json("/api/setup")).auth.state).toBe("ok");
   });
 
+  test("the Test auth log is stored redacted", async () => {
+    t = setup();
+    await t.post("/api/setup", { harness: "other" }, "PUT");
+    t.harnesses[1]!.authLog = " eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJl";
+    expect((await (await t.post("/api/setup/test-auth")).json()).auth.log).toBe("other auth: ok [redacted]");
+  });
+
   test("an auth or quota failure pauses the queue, and a passing Test auth resumes it", async () => {
     t = setup();
     await t.post("/api/setup", { harness: "claude-code" }, "PUT");
