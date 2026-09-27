@@ -242,6 +242,16 @@ describe("webhook transport", () => {
       webhookPayload({ repository: { archived: true } }),
     );
     expect(resArchived.status).toBe(204);
+
+    // Unknown installation ID
+    const resUnknownInstall = await sendWebhook(
+      t.app,
+      secret,
+      "issues",
+      "d-unknown-inst",
+      webhookPayload({ installation: { id: 999 } }),
+    );
+    expect(resUnknownInstall.status).toBe(204);
   });
 
   test("duplicate delivery returns 204", async () => {
@@ -259,6 +269,14 @@ describe("webhook transport", () => {
     // Different delivery GUID for an already-queued issue returns 204
     const resDupJob = await sendWebhook(t.app, secret, "issues", "d-new-guid", webhookPayload({ issue: { number: 10 } }));
     expect(resDupJob.status).toBe(204);
+
+    // Concurrent deliveries for the same delivery GUID: exactly one 202, the other 204
+    const [resRace1, resRace2] = await Promise.all([
+      sendWebhook(t.app, secret, "issues", "d-race", webhookPayload({ issue: { number: 11 } })),
+      sendWebhook(t.app, secret, "issues", "d-race", webhookPayload({ issue: { number: 11 } })),
+    ]);
+    const statuses = [resRace1.status, resRace2.status].sort();
+    expect(statuses).toEqual([202, 204]);
   });
 
   test("webhook-queued jobs go through the same intake filters as scanned ones", async () => {
@@ -319,7 +337,7 @@ describe("webhook transport", () => {
     expect(resRefPr.status).toBe(202);
     expect(await jobFor(4)).toMatchObject({ state: "skipped", skip_reason: "referenced by open PR" });
 
-    // 5. Closed issue -> skipped: closed
+    // 5. Closed issue -> returns 204 with no job created (matches scan behavior)
     const resClosed = await sendWebhook(
       t.app,
       secret,
@@ -327,8 +345,8 @@ describe("webhook transport", () => {
       "d-closed",
       webhookPayload({ issue: { number: 5, state: "closed" } }),
     );
-    expect(resClosed.status).toBe(202);
-    expect(await jobFor(5)).toMatchObject({ state: "skipped", skip_reason: "closed" });
+    expect(resClosed.status).toBe(204);
+    expect(await jobFor(5)).toBeUndefined();
 
     // 6. Trusted author (COLLABORATOR) with no blocks -> queued
     const resCollab = await sendWebhook(

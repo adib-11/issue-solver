@@ -1,5 +1,5 @@
 import { $ } from "bun";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Hono } from "hono";
@@ -216,6 +216,13 @@ function candidateSkipReason(issue: Issue): (typeof FILTER_REASONS)[number] | nu
   return null;
 }
 
+function computeIntake(issue: Issue): { state: (typeof JOB_STATES)[number]; skip: string | null; reason: (typeof FILTER_REASONS)[number] | "closed" | null } {
+  const reason = issue.state === "CLOSED" ? "closed" : candidateSkipReason(issue);
+  const skip = reason ?? (TRUSTED_AUTHORS.includes(issue.authorAssociation) ? null : UNTRUSTED_AUTHOR);
+  const state = skip ? "skipped" : "queued";
+  return { state, skip, reason };
+}
+
 const PAUSE_REASONS: Partial<Record<AuthCheckState | RunError, string>> = {
   auth: "Harness auth failed: log in again as the setup page shows, then click Test auth.",
   quota: "Harness quota exhausted: wait for it to reset, then click Test auth.",
@@ -246,7 +253,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   const upsertRepo = db.query(`INSERT INTO repos (id, full_name, installation_id) VALUES (?, ?, ?)
     ON CONFLICT (id) DO UPDATE SET full_name = excluded.full_name, installation_id = excluded.installation_id`);
   const getDelivery = db.query<{ guid: string }, [string]>("SELECT guid FROM deliveries WHERE guid = ?");
-  const insertDelivery = db.query("INSERT INTO deliveries (guid, delivered_at) VALUES (?, ?)");
+  const insertDelivery = db.query("INSERT INTO deliveries (guid, delivered_at) VALUES (?, ?) ON CONFLICT (guid) DO NOTHING");
   const getJobByRepoAndNumber = db.query<Job, [number, number]>("SELECT * FROM jobs WHERE repo_id = ? AND issue_number = ?");
 
   const getSettingQuery = db.query<{ value: string }, [string]>("SELECT value FROM settings WHERE key = ?");
@@ -276,9 +283,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
       .sort((a, b) => Date.parse(a.issue.createdAt) - Date.parse(b.issue.createdAt));
     db.transaction(() => {
       for (const { repo, issue } of found) {
-        const reason = issue.state === "CLOSED" ? "closed" : candidateSkipReason(issue);
-        const skip = reason ?? (TRUSTED_AUTHORS.includes(issue.authorAssociation) ? null : UNTRUSTED_AUTHOR);
-        const state = skip ? "skipped" : "queued";
+        const { state, skip, reason } = computeIntake(issue);
         if (reason) skipJob.run(reason, at, repo.id, issue.number);
         else liftSkip.run(state, skip, at, repo.id, issue.number);
         if (issue.state === "CLOSED") continue;
@@ -863,6 +868,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     return basicAuth({ username: "admin", password: config.adminPassword })(c, next);
   });
   http.use(async (c, next) => {
+    if (webhookPaths.includes(c.req.path)) return next();
     await reconciling;
     await next();
   });
@@ -887,13 +893,13 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
       }
 
       const sig = c.req.header("x-hub-signature-256");
-      if (!sig || !config.webhookSecret) {
+      if (!sig || !config.webhookSecret || !sig.startsWith("sha256=")) {
         return c.json({ error: "Unauthorized" }, 401);
       }
       const computed = `sha256=${createHmac("sha256", config.webhookSecret).update(rawBuffer).digest("hex")}`;
-      const sigBuf = Buffer.from(sig);
-      const compBuf = Buffer.from(computed);
-      if (sigBuf.length !== compBuf.length || !timingSafeEqual(sigBuf, compBuf)) {
+      const sigHash = createHash("sha256").update(sig).digest();
+      const compHash = createHash("sha256").update(computed).digest();
+      if (!timingSafeEqual(sigHash, compHash) || sig.length !== computed.length) {
         return c.json({ error: "Unauthorized" }, 401);
       }
 
@@ -907,9 +913,6 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
       const guid = c.req.header("x-github-delivery");
       if (!guid) {
         return c.json({ error: "Missing X-GitHub-Delivery header" }, 400);
-      }
-      if (getDelivery.get(guid)) {
-        return c.body(null, 204);
       }
 
       const event = c.req.header("x-github-event");
@@ -927,13 +930,17 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
         return c.body(null, 204);
       }
 
+      const installations = await github.listInstallations().catch(() => []);
+      const validInstallation = installations.some(
+        (inst) => inst.id === installation.id && inst.account.type === "User" && inst.account.login.toLowerCase() === config.ownerLogin.toLowerCase(),
+      );
+      if (!validInstallation) {
+        return c.body(null, 204);
+      }
+
       const rawIssue = payload.issue;
       if (!rawIssue || typeof rawIssue.number !== "number") {
         return c.json({ error: "Malformed issue payload" }, 400);
-      }
-
-      if (getJobByRepoAndNumber.get(repo.id, rawIssue.number)) {
-        return c.body(null, 204);
       }
 
       const assigneesCount =
@@ -971,16 +978,26 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
         timelineItems,
       };
 
-      const reason = issueObj.state === "CLOSED" ? "closed" : candidateSkipReason(issueObj);
-      const skip = reason ?? (TRUSTED_AUTHORS.includes(issueObj.authorAssociation) ? null : UNTRUSTED_AUTHOR);
-      const state = skip ? "skipped" : "queued";
+      if (issueObj.state === "CLOSED") {
+        return c.body(null, 204);
+      }
+
+      const { state, skip } = computeIntake(issueObj);
       const at = now();
 
-      db.transaction(() => {
-        insertDelivery.run(guid, at);
+      const committed = db.transaction(() => {
+        const deliveryResult = insertDelivery.run(guid, at);
+        if (deliveryResult.changes === 0) return false;
+        if (getJobByRepoAndNumber.get(repo.id, issueObj.number)) return false;
         upsertRepo.run(repo.id, repo.full_name, installation.id);
-        insertJob.run(repo.id, repo.full_name, issueObj.number, issueObj.title, issueObj.url, state, skip, at, at);
+        const jobResult = insertJob.run(repo.id, repo.full_name, issueObj.number, issueObj.title, issueObj.url, state, skip, at, at);
+        if (jobResult.changes === 0) return false;
+        return true;
       })();
+
+      if (!committed) {
+        return c.body(null, 204);
+      }
 
       if (state === "queued") {
         void work();
