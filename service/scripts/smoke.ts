@@ -1,5 +1,5 @@
-// Opt-in smoke test, never run in CI: runs a real harness CLI through the conventions and brief phases on an
-// issue of a throwaway repo of yours. It uses your subscription, so it spends real quota, and the GitHub CLI
+// Opt-in smoke test, never run in CI: runs a real harness CLI through the conventions, brief, and implement phases
+// on an issue of a throwaway repo of yours, and commits the change in a temporary checkout (never pushed). It uses your subscription, so it spends real quota, and the GitHub CLI
 // (gh), logged in, to clone the repo and read the issue.
 // Usage: CLAUDE_CODE_OAUTH_TOKEN=... bun scripts/smoke.ts <owner/repo> <issue number>
 //    or: CODEX_HOME=<dir with a ChatGPT-login auth.json> bun scripts/smoke.ts --codex <owner/repo> <issue number>
@@ -12,7 +12,8 @@ import { claudeCode } from "../src/claude-code";
 import { codex } from "../src/codex";
 import { CONVENTIONS_PROMPT, CONVENTIONS_SCHEMA, CONVENTIONS_TIMEOUT_MS } from "../src/conventions";
 import type { RunOptions } from "../src/harness";
-import { type Conventions, type IssueSnapshot, TRUSTED_AUTHORS } from "../src/jobs";
+import { changeError, commitChange, gitConfigHash, IMPLEMENT_SCHEMA, IMPLEMENT_TIMEOUT_MS, type Implemented, implementError, implementPrompt } from "../src/implement";
+import { type Brief, type Conventions, type IssueSnapshot, TRUSTED_AUTHORS } from "../src/jobs";
 
 const args = process.argv.slice(2);
 const useCodex = args[0] === "--codex";
@@ -29,14 +30,14 @@ const workspace = mkdtempSync(join(tmpdir(), "smoke-"));
 const bin = (name: string) => [join(import.meta.dir, "../node_modules/.bin", name)];
 const harness = useCodex ? codex({ home: codexHome!, command: bin("codex") }) : claudeCode({ token, command: bin("claude") });
 
-async function phase(name: string, options: Omit<RunOptions, "workspace">) {
+async function phase(name: string, options: Omit<RunOptions, "workspace">, editsFiles = false) {
   const result = await harness.run({ ...options, workspace });
   if (!result.ok) {
     console.error(`${name}: ${result.error}\n${result.log.slice(-4000)}`);
     process.exit(1);
   }
   console.log(`--- ${name} ---\n${JSON.stringify(result.output, null, 2)}`);
-  const status = (await $`git -C ${workspace} status --porcelain`.text()).trim();
+  const status = editsFiles ? "" : (await $`git -C ${workspace} status --porcelain`.text()).trim();
   if (status) {
     console.error(`The agent changed files in ${name}, which it must not:\n${status}`);
     process.exit(1);
@@ -56,12 +57,23 @@ try {
   };
 
   const conventions = (await phase("conventions", { prompt: CONVENTIONS_PROMPT, schema: CONVENTIONS_SCHEMA, timeoutMs: CONVENTIONS_TIMEOUT_MS })) as Conventions;
-  const brief = await phase("brief", { prompt: briefPrompt(issue, conventions), schema: BRIEF_SCHEMA, timeoutMs: BRIEF_TIMEOUT_MS });
+  const brief = (await phase("brief", { prompt: briefPrompt(issue, conventions), schema: BRIEF_SCHEMA, timeoutMs: BRIEF_TIMEOUT_MS })) as Brief;
   const invalid = briefError(brief);
   if (invalid) {
     console.error(`brief: bad_output: ${invalid}`);
     process.exit(1);
   }
+  if (brief.outcome === "needs_info") process.exit(0);
+
+  const base = (await $`git -C ${workspace} rev-parse HEAD`.text()).trim();
+  const configHash = gitConfigHash(workspace);
+  const implemented = (await phase("implement", { prompt: implementPrompt(brief, conventions), schema: IMPLEMENT_SCHEMA, timeoutMs: IMPLEMENT_TIMEOUT_MS }, true)) as Implemented;
+  const rejected = implementError(implemented) ?? (await changeError(workspace, base, configHash, conventions.has_tests, implemented.tests_added.map((t) => t.file)));
+  if (rejected) {
+    console.error(`implement: ${rejected}`);
+    process.exit(1);
+  }
+  console.log(`--- commit ---\n${JSON.stringify(await commitChange(workspace, implemented.commit_message), null, 2)}`);
 } finally {
   rmSync(workspace, { recursive: true, force: true });
 }

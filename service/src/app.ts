@@ -8,9 +8,10 @@ import type { Config } from "./config";
 import { BRIEF_SCHEMA, BRIEF_TIMEOUT_MS, briefError, briefPrompt, questionsComment } from "./brief";
 import { CONVENTIONS_PROMPT, CONVENTIONS_SCHEMA, CONVENTIONS_TIMEOUT_MS, conventionsHash } from "./conventions";
 import { openDb } from "./db";
+import { changeError, commitChange, gitConfigHash, IMPLEMENT_SCHEMA, IMPLEMENT_TIMEOUT_MS, type Implemented, implementError, implementPrompt } from "./implement";
 import type { GitHub, Issue, Repo } from "./github";
 import { type AuthCheckState, type Harness, type RunError, type RunOptions, schemaError, type SetupView } from "./harness";
-import { type Attempt, type Brief, type Conventions, JOB_STATES, type IssueSnapshot, type Job, type JobDetail, NO_CHECKS, type Phase, type RepoView, TRUSTED_AUTHORS, UNTRUSTED_AUTHOR } from "./jobs";
+import { type Attempt, type Brief, type Commit, type Conventions, JOB_STATES, type IssueSnapshot, type Job, type JobDetail, NO_CHECKS, type Phase, type RepoView, TRUSTED_AUTHORS, UNTRUSTED_AUTHOR } from "./jobs";
 import type { Runner } from "./runner";
 
 const PAGE_SIZE = 50;
@@ -31,7 +32,7 @@ type RepoRow = {
 };
 
 const LOG_LIMIT_BYTES = 200 * 1024;
-const PIPELINE_ENDS = "Pipeline ends here: the phases after brief are not built yet.";
+const PIPELINE_ENDS = "Pipeline ends here: the phases after implement are not built yet.";
 const INTERRUPTED = "Interrupted by a restart";
 // GitHub tokens, Claude tokens, and JWTs (Codex's ChatGPT tokens), wherever they come from; configured harness
 // credentials are redacted by value too.
@@ -183,6 +184,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   );
   const setBaseSha = db.query("UPDATE attempts SET base_sha = ? WHERE id = ?");
   const setIssue = db.query("UPDATE attempts SET issue = ? WHERE id = ?");
+  const addCommit = db.query("UPDATE attempts SET commits = json_insert(commits, '$[#]', json(?)) WHERE id = ?");
   const endAttempt = db.query("UPDATE attempts SET finished_at = ?, result = ? WHERE id = ?");
   const endJob = db.query("UPDATE jobs SET state = ?, skip_reason = ?, phase = NULL, updated_at = ? WHERE id = ?");
   const setPhase = db.query("UPDATE jobs SET phase = ?, updated_at = ? WHERE id = ?");
@@ -249,7 +251,9 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
       return finish(claimed, "failed", `checkout: ${redact((err as Error).message)}`);
     }
     await $`git -C ${workspace} config core.hooksPath /dev/null`;
-    setBaseSha.run((await $`git -C ${workspace} rev-parse HEAD`.text()).trim(), attemptId);
+    const configHash = gitConfigHash(workspace);
+    const baseSha = (await $`git -C ${workspace} rev-parse HEAD`.text()).trim();
+    setBaseSha.run(baseSha, attemptId);
 
     // A fresh snapshot every attempt: Retry after editing the issue briefs the edited text.
     let fetched: IssueSnapshot;
@@ -288,6 +292,19 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
       }
       return finish(claimed, "needs_info", result);
     }
+
+    const implemented = await runPhase(
+      claimed,
+      "implement",
+      { prompt: implementPrompt(brief, conventions), schema: IMPLEMENT_SCHEMA, timeoutMs: IMPLEMENT_TIMEOUT_MS },
+      implementError,
+    );
+    if (!implemented.ok) return harnessFailed(claimed, "implement", implemented.error);
+    const { tests_added, commit_message } = implemented.output as Implemented;
+    const testFiles = [...new Set(tests_added.map((t) => t.file))];
+    const rejected = await changeError(workspace, baseSha, configHash, conventions.has_tests, testFiles);
+    if (rejected) return finish(claimed, "failed", `implement: ${rejected}`);
+    addCommit.run(JSON.stringify(await commitChange(workspace, commit_message)), attemptId);
     finish(claimed, "failed", PIPELINE_ENDS);
   }
 
@@ -352,8 +369,8 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   });
 
   type Stored<T, K extends keyof T> = Omit<T, K> & { [P in K]: string | null };
-  const listAttempts = db.query<Stored<Omit<Attempt, "phases">, "issue">, [number]>(
-    "SELECT id, harness, base_sha, started_at, finished_at, result, issue FROM attempts WHERE job_id = ? ORDER BY id",
+  const listAttempts = db.query<Stored<Omit<Attempt, "phases">, "issue" | "commits">, [number]>(
+    "SELECT id, harness, base_sha, started_at, finished_at, result, issue, commits FROM attempts WHERE job_id = ? ORDER BY id",
   );
   const listPhases = db.query<Stored<Phase, "output">, [number]>(
     "SELECT name, started_at, finished_at, outcome, log, output FROM phases WHERE attempt_id = ? ORDER BY id",
@@ -364,6 +381,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     const attempts = listAttempts.all(job.id).map((a) => ({
       ...a,
       issue: parse<IssueSnapshot>(a.issue),
+      commits: parse<Commit[]>(a.commits)!,
       phases: listPhases.all(a.id).map((p) => ({ ...p, output: parse(p.output) })),
     }));
     return c.json({ ...job, attempts } satisfies JobDetail);
