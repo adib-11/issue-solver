@@ -12,7 +12,8 @@ import { changeError, commitChange, gitConfigHash, IMPLEMENT_SCHEMA, IMPLEMENT_T
 import type { GitHub, Issue, Repo } from "./github";
 import { type AuthCheckState, type Harness, type RunError, type RunOptions, schemaError, type SetupView } from "./harness";
 import { type Attempt, type Brief, type Commit, type Conventions, JOB_STATES, type IssueSnapshot, type Job, type JobDetail, NO_CHECKS, type Phase, type RepoView, TRUSTED_AUTHORS, UNTRUSTED_AUTHOR } from "./jobs";
-import type { Runner } from "./runner";
+import type { Runner, Sandbox } from "./runner";
+import { checks, redGreen, type Verified } from "./verify";
 
 const PAGE_SIZE = 50;
 const SCAN_INTERVAL_MS = 60_000;
@@ -32,7 +33,7 @@ type RepoRow = {
 };
 
 const LOG_LIMIT_BYTES = 200 * 1024;
-const PIPELINE_ENDS = "Pipeline ends here: the phases after implement are not built yet.";
+const PIPELINE_ENDS = "Pipeline ends here: the phases after checks are not built yet.";
 const INTERRUPTED = "Interrupted by a restart";
 // GitHub tokens, Claude tokens, and JWTs (Codex's ChatGPT tokens), wherever they come from; configured harness
 // credentials are redacted by value too.
@@ -58,8 +59,8 @@ const PAUSE_REASONS: Partial<Record<AuthCheckState | RunError, string>> = {
   quota: "Harness quota exhausted: wait for it to reset, then click Test auth.",
 };
 
-export function createApp(deps: { config: Config; github: GitHub; clock: Clock; harnesses: Harness[]; runner: Runner }) {
-  const { config, github, clock, harnesses, runner } = deps;
+export function createApp(deps: { config: Config; github: GitHub; clock: Clock; harnesses: Harness[]; runner: Runner; sandbox: Sandbox }) {
+  const { config, github, clock, harnesses, runner, sandbox } = deps;
   const db = openDb(config.dbPath);
   const iso = (ms: number) => new Date(ms).toISOString();
   const now = () => iso(clock.now());
@@ -234,6 +235,24 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     return result;
   }
 
+  /** Runs one controller phase; false when it failed the attempt. */
+  async function verifyPhase(claimed: Claimed, name: string, verify: () => Promise<Verified>) {
+    setPhase.run(name, now(), claimed.job.id);
+    const phase = startPhase.get(claimed.attemptId, name, now())!;
+    let verified: Verified;
+    try {
+      verified = await verify();
+    } catch (err) {
+      endPhase.run(now(), "error", "", null, phase.id);
+      throw err;
+    }
+    const { output, log, error } = verified;
+    const outcome = output.skipped ? "skipped" : error === "timeout" ? "timeout" : error ? "failed" : "ok";
+    endPhase.run(now(), outcome, capLog(redact(log)), JSON.stringify(output), phase.id);
+    if (error) finish(claimed, "failed", `${name}: ${redact(error)}`);
+    return !error;
+  }
+
   /** auth and quota pause dispatch and put the job back in the queue; other errors fail the job. */
   function harnessFailed(claimed: Claimed, phase: string, error: RunError) {
     const pause = PAUSE_REASONS[error];
@@ -301,9 +320,14 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     );
     if (!implemented.ok) return harnessFailed(claimed, "implement", implemented.error);
     const { tests_added, commit_message } = implemented.output as Implemented;
-    const rejected = await changeError(workspace, baseSha, configHash, conventions.has_tests, tests_added.map((t) => t.file));
+    const testFiles = tests_added.map((t) => t.file);
+    const rejected = await changeError(workspace, baseSha, configHash, conventions.has_tests, testFiles);
     if (rejected) return finish(claimed, "failed", `implement: ${rejected}`);
-    addCommit.run(JSON.stringify(await commitChange(workspace, commit_message)), attemptId);
+    const head = await commitChange(workspace, commit_message);
+    addCommit.run(JSON.stringify(head), attemptId);
+
+    if (!(await verifyPhase(claimed, "red/green", () => redGreen(sandbox, workspace, baseSha, head.sha, conventions, testFiles)))) return;
+    if (!(await verifyPhase(claimed, "checks", () => checks(sandbox, workspace, head.sha, conventions)))) return;
     finish(claimed, "failed", PIPELINE_ENDS);
   }
 
