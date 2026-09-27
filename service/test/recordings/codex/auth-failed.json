@@ -1,0 +1,5 @@
+{
+  "exit": 1,
+  "stderr": "OpenAI Codex v0.157.1\nERROR: unexpected status 401 Unauthorized: Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.\n",
+  "stdout": []
+}

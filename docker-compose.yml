@@ -15,11 +15,15 @@ services:
       COMMENT_QUESTIONS: ${COMMENT_QUESTIONS:-false}
       RUNNER_IMAGE: auto-solve-runner:local
       WORKSPACE_VOLUME: auto-solve-workspaces
+      CODEX_HOME: /codex
+      CODEX_VOLUME: auto-solve-codex
     secrets:
       - github_app_key
     volumes:
       - data:/data
       - workspaces:/workspaces
+      # Codex's ChatGPT login (auth.json), refreshed in place; runners mount it only when Codex is the harness.
+      - codex:/codex
       # The controller starts the runner containers. Only it holds the socket; runners never get it.
       - /var/run/docker.sock:/var/run/docker.sock
     # The group that owns the Docker socket on the host, so the nonroot controller can use it.
@@ -46,3 +50,5 @@ volumes:
   data:
   workspaces:
     name: auto-solve-workspaces
+  codex:
+    name: auto-solve-codex

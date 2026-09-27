@@ -28,6 +28,31 @@ export interface Harness {
   run(options: RunOptions): Promise<RunResult>;
 }
 
+export type CliResult = { stdout: string; stderr: string; exitCode: number } | { timeout: true } | { startError: string };
+
+/** Runs a CLI with the prompt on stdin, and stops waiting at the deadline even if a leftover subprocess still holds the pipes open. */
+export async function runCli(argv: string[], options: { cwd: string; stdin: string; env: Record<string, string>; timeoutMs: number }): Promise<CliResult> {
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(argv, { cwd: options.cwd, stdin: new Blob([options.stdin]), stdout: "pipe", stderr: "pipe", env: options.env });
+  } catch (err) {
+    return { startError: `Could not start ${argv.join(" ")}: ${(err as Error).message}` };
+  }
+  let timer: Timer | undefined;
+  const deadline = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), options.timeoutMs);
+  });
+  const stdout = new Response(proc.stdout as ReadableStream).text();
+  const stderr = new Response(proc.stderr as ReadableStream).text();
+  const finished = await Promise.race([Promise.all([stdout, stderr, proc.exited]), deadline]);
+  clearTimeout(timer);
+  if (finished === "timeout") {
+    proc.kill("SIGKILL");
+    return { timeout: true };
+  }
+  return { stdout: finished[0], stderr: finished[1], exitCode: finished[2] };
+}
+
 /** GET /api/setup: shared by the controller and the dashboard. */
 export type SetupView = {
   harness: string | null;

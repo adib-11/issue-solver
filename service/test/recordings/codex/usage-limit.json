@@ -1,0 +1,5 @@
+{
+  "exit": 1,
+  "stderr": "OpenAI Codex v0.157.1\nERROR: unexpected status 429 Too Many Requests: You've hit your usage limit. Upgrade to Pro or try again in 3 days.\n",
+  "stdout": []
+}

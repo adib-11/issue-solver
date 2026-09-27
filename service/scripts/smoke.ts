@@ -1,26 +1,33 @@
-// Opt-in smoke test, never run in CI: runs the real Claude Code CLI through the conventions and brief phases
-// on an issue of a throwaway repo of yours. It needs your subscription token, so it spends real quota, and
-// the GitHub CLI (gh), logged in, to clone the repo and read the issue.
+// Opt-in smoke test, never run in CI: runs a real harness CLI through the conventions and brief phases on an
+// issue of a throwaway repo of yours. It uses your subscription, so it spends real quota, and the GitHub CLI
+// (gh), logged in, to clone the repo and read the issue.
 // Usage: CLAUDE_CODE_OAUTH_TOKEN=... bun scripts/smoke.ts <owner/repo> <issue number>
+//    or: CODEX_HOME=<dir with a ChatGPT-login auth.json> bun scripts/smoke.ts --codex <owner/repo> <issue number>
 import { $ } from "bun";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BRIEF_SCHEMA, BRIEF_TIMEOUT_MS, briefError, briefPrompt } from "../src/brief";
 import { claudeCode } from "../src/claude-code";
+import { codex } from "../src/codex";
 import { CONVENTIONS_PROMPT, CONVENTIONS_SCHEMA, CONVENTIONS_TIMEOUT_MS } from "../src/conventions";
 import type { RunOptions } from "../src/harness";
 import { type Conventions, type IssueSnapshot, TRUSTED_AUTHORS } from "../src/jobs";
 
-const [repo, number] = process.argv.slice(2);
+const args = process.argv.slice(2);
+const useCodex = args[0] === "--codex";
+const [repo, number] = useCodex ? args.slice(1) : args;
 const token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-if (!repo || !number || !token) {
+const codexHome = process.env.CODEX_HOME;
+if (!repo || !number || !(useCodex ? codexHome : token)) {
   console.error("Usage: CLAUDE_CODE_OAUTH_TOKEN=... bun scripts/smoke.ts <owner/repo> <issue number>");
+  console.error("   or: CODEX_HOME=... bun scripts/smoke.ts --codex <owner/repo> <issue number>");
   process.exit(2);
 }
 
 const workspace = mkdtempSync(join(tmpdir(), "smoke-"));
-const harness = claudeCode({ token, command: [join(import.meta.dir, "../node_modules/.bin/claude")] });
+const bin = (name: string) => [join(import.meta.dir, "../node_modules/.bin", name)];
+const harness = useCodex ? codex({ home: codexHome!, command: bin("codex") }) : claudeCode({ token, command: bin("claude") });
 
 async function phase(name: string, options: Omit<RunOptions, "workspace">) {
   const result = await harness.run({ ...options, workspace });

@@ -6,6 +6,7 @@
       "name": "auto-solve",
       "dependencies": {
         "@anthropic-ai/claude-code": "2.1.283",
+        "@openai/codex": "0.157.1",
         "hono": "4.13.9",
       },
       "devDependencies": {
@@ -44,6 +45,20 @@
     "@jridgewell/sourcemap-codec": ["@jridgewell/sourcemap-codec@1.6.0", "", {}, "sha512-T7jf+5zgsZHwNJ4lvQ7/aezbyk0nNX+zJVWpmHA7VYsEx7a7qr5Rg5IbtJFqkgze5Y2sruq1RUY8Q837Od7iFw=="],
 
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.31", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.1.0", "@jridgewell/sourcemap-codec": "^1.4.14" } }, "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw=="],
+
+    "@openai/codex": ["@openai/codex@0.157.1", "", { "optionalDependencies": { "@openai/codex-darwin-arm64": "npm:@openai/codex@0.157.1-darwin-arm64", "@openai/codex-darwin-x64": "npm:@openai/codex@0.157.1-darwin-x64", "@openai/codex-linux-arm64": "npm:@openai/codex@0.157.1-linux-arm64", "@openai/codex-linux-x64": "npm:@openai/codex@0.157.1-linux-x64", "@openai/codex-win32-arm64": "npm:@openai/codex@0.157.1-win32-arm64", "@openai/codex-win32-x64": "npm:@openai/codex@0.157.1-win32-x64" }, "bin": { "codex": "bin/codex.js" } }, "sha512-qJ/UZ0bmYP+/Umav1L9WpmtMYeA6q1+4r4qILSYOKQZhP7WRdjyTQWz3O0dTImZ9RT7AazZa85D87xRDHogcHw=="],
+
+    "@openai/codex-darwin-arm64": ["@openai/codex@0.157.1-darwin-arm64", "", { "os": "darwin", "cpu": "arm64" }, "sha512-62/e4TZ34z93KK3FYIHmo/K88aH0JRPA8x7SAVBdK4iG9f9HPO2tsDrJcmOj9z6DrFpMvPEVymomCbYpqN+ylQ=="],
+
+    "@openai/codex-darwin-x64": ["@openai/codex@0.157.1-darwin-x64", "", { "os": "darwin", "cpu": "x64" }, "sha512-PscZvqKD4zlaSw1nM5Sh4lU1M+01sr4b3qzGx8pf+4OLyULg1z1yAyTR1c35C3t62H8DXy/14y7oazTR3JMMKA=="],
+
+    "@openai/codex-linux-arm64": ["@openai/codex@0.157.1-linux-arm64", "", { "os": "linux", "cpu": "arm64" }, "sha512-nEaBZT3ldrtqUNaBlvI+Y+fg+LbNCTsQjbUnl7Q45rl9vSSqHU2vRj1l6iJDwupZkrpeIJ/ClHIwxgMKv1SKHg=="],
+
+    "@openai/codex-linux-x64": ["@openai/codex@0.157.1-linux-x64", "", { "os": "linux", "cpu": "x64" }, "sha512-Eac8XlC0nCXSeUjDU9l8yLJ6P9evv1mO+AnvILoNwlegBC7B3AVXqJ05QcMhQX7RcJ3Lk2618ykCb2X2ui8VAQ=="],
+
+    "@openai/codex-win32-arm64": ["@openai/codex@0.157.1-win32-arm64", "", { "os": "win32", "cpu": "arm64" }, "sha512-tFkxdrSXPUDQXXp3JwTxNOgI17RQcexyuaZTiNmL1A/UaVtVmVBNe+8cBk3r8b7dLpaoWFbjPwL7p5SBCrkLQg=="],
+
+    "@openai/codex-win32-x64": ["@openai/codex@0.157.1-win32-x64", "", { "os": "win32", "cpu": "x64" }, "sha512-vgqs/VRXNwhLYMsZDgYfnRSXpRh5Nm782L8lacGskw86kOxbMaquvQKxkuZHUBrJA2XGcksB7rMUHy1XaCJgrA=="],
 
     "@parcel/watcher": ["@parcel/watcher@2.5.1", "", { "dependencies": { "detect-libc": "^1.0.3", "is-glob": "^4.0.3", "micromatch": "^4.0.5", "node-addon-api": "^7.0.0" }, "optionalDependencies": { "@parcel/watcher-android-arm64": "2.5.1", "@parcel/watcher-darwin-arm64": "2.5.1", "@parcel/watcher-darwin-x64": "2.5.1", "@parcel/watcher-freebsd-x64": "2.5.1", "@parcel/watcher-linux-arm-glibc": "2.5.1", "@parcel/watcher-linux-arm-musl": "2.5.1", "@parcel/watcher-linux-arm64-glibc": "2.5.1", "@parcel/watcher-linux-arm64-musl": "2.5.1", "@parcel/watcher-linux-x64-glibc": "2.5.1", "@parcel/watcher-linux-x64-musl": "2.5.1", "@parcel/watcher-win32-arm64": "2.5.1", "@parcel/watcher-win32-ia32": "2.5.1", "@parcel/watcher-win32-x64": "2.5.1" } }, "sha512-dfUnCxiN9H4ap84DvD2ubjw+3vUNpstxa0TneY/Paat8a3R4uQZDLSvWjmznAY/DoahqTHl9V46HF/Zs3F29pg=="],
 

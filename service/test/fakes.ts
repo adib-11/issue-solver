@@ -103,8 +103,8 @@ export class FakeHarness implements Harness {
 
 export class FakeRunner implements Runner {
   cleanups = 0;
-  command(workspace: string) {
-    return ["runner", workspace];
+  command(workspace: string, harness: string) {
+    return ["runner", harness, workspace];
   }
   async cleanup() {
     this.cleanups++;
@@ -180,6 +180,8 @@ export function setup() {
     appId: "1",
     privateKey: "unused",
     adminPassword: PASSWORD,
+    codexHome: join(dir, "codex"),
+    codexVolume: "codex",
     dbPath: join(dir, "db.sqlite"),
     workspacesDir: join(dir, "workspaces"),
     runnerImage: "runner:test",

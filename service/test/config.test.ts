@@ -42,3 +42,7 @@ test("the Claude Code token is optional and trimmed", () => {
   expect(loadConfig(full).claudeOauthToken).toBeUndefined();
   expect(loadConfig({ ...full, CLAUDE_CODE_OAUTH_TOKEN: " sk-ant-oat01-x \n" }).claudeOauthToken).toBe("sk-ant-oat01-x");
 });
+
+test("Codex keeps its login on the codex volume at /codex by default", () => {
+  expect(loadConfig(full)).toMatchObject({ codexHome: "/codex", codexVolume: "auto-solve-codex" });
+});

@@ -1,5 +1,5 @@
 import { tmpdir } from "node:os";
-import { type Harness, type RunError, type RunOptions, type RunResult, schemaError } from "./harness";
+import { type Harness, type RunError, type RunOptions, type RunResult, runCli, schemaError } from "./harness";
 
 // Typed error categories on stream-json assistant messages.
 const TYPED_ERRORS: Record<string, RunError> = { rate_limit: "quota", billing_error: "quota", authentication_failed: "auth" };
@@ -27,32 +27,15 @@ export function claudeCode(options: { token?: string; command?: string[] }): Har
   async function run({ prompt, schema, workspace, timeoutMs, wrap = [] }: RunOptions): Promise<RunResult> {
     if (!token) return { ok: false, error: "auth", log: "CLAUDE_CODE_OAUTH_TOKEN is not set." };
     const args = ["-p", "--output-format", "stream-json", "--verbose", "--json-schema", JSON.stringify(schema), "--dangerously-skip-permissions"];
-    let proc: ReturnType<typeof Bun.spawn>;
-    try {
-      proc = Bun.spawn([...wrap, ...command, ...args], {
-        cwd: workspace,
-        stdin: new Blob([prompt]),
-        stdout: "pipe",
-        stderr: "pipe",
-        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", CLAUDE_CODE_OAUTH_TOKEN: token },
-      });
-    } catch (err) {
-      return { ok: false, error: "crash", log: `Could not start ${command.join(" ")}: ${(err as Error).message}` };
-    }
-    // Stop waiting at the deadline even if a leftover subprocess still holds the pipes open.
-    let timer: Timer | undefined;
-    const deadline = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => resolve("timeout"), timeoutMs);
+    const ran = await runCli([...wrap, ...command, ...args], {
+      cwd: workspace,
+      stdin: prompt,
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", CLAUDE_CODE_OAUTH_TOKEN: token },
+      timeoutMs,
     });
-    const stdoutText = new Response(proc.stdout as ReadableStream).text();
-    const stderrText = new Response(proc.stderr as ReadableStream).text();
-    const finished = await Promise.race([Promise.all([stdoutText, stderrText, proc.exited]), deadline]);
-    clearTimeout(timer);
-    if (finished === "timeout") {
-      proc.kill("SIGKILL");
-      return { ok: false, error: "timeout", log: `Killed after ${timeoutMs} ms.` };
-    }
-    const [stdout, stderr, exitCode] = finished;
+    if ("startError" in ran) return { ok: false, error: "crash", log: ran.startError };
+    if ("timeout" in ran) return { ok: false, error: "timeout", log: `Killed after ${timeoutMs} ms.` };
+    const { stdout, stderr, exitCode } = ran;
 
     const log = redact(stderr ? `${stdout}\n--- stderr ---\n${stderr}` : stdout);
     const events = stdout.split("\n").flatMap((line) => {
