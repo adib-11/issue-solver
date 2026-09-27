@@ -91,8 +91,6 @@ test(".env.example lists every required and optional setting with comments", () 
   for (const key of expectedKeys) {
     const keyIndex = lines.findIndex((line) => line.startsWith(`${key}=`));
     expect(keyIndex).toBeGreaterThan(-1);
-    const precedingLine = (keyIndex > 0 ? lines[keyIndex - 1] : "")?.trim() ?? "";
-    expect(precedingLine.startsWith("#")).toBe(true);
     // Comment block preceding the key must explicitly note whether it is required or optional
     const commentBlock: string[] = [];
     let idx = keyIndex - 1;
@@ -100,6 +98,7 @@ test(".env.example lists every required and optional setting with comments", () 
       commentBlock.unshift(lines[idx]!);
       idx--;
     }
+    expect(commentBlock.length).toBeGreaterThan(0);
     const fullComment = commentBlock.join(" ");
     expect(fullComment.toLowerCase()).toMatch(/required|optional/);
   }

@@ -5,7 +5,7 @@
 1. **The manual `solve-issue` skill bundle**: An interactive, user-invoked Agent Skills workflow that guides you from issue selection to an opened PR inside your agent harness (Claude Code, Codex, Cursor). Works on any repository (personal, forks, or external open-source projects).
 2. **The automated `auto-solve` service**: An unattended, self-hosted service that continuously watches your personal GitHub repositories, picks up open issues, and runs the entire quality pipeline in isolated Docker containers, publishing one draft PR per issue.
 
-Both surfaces live in this repository and share the exact same prompt definitions and engineering standards from [`skills/`](file:///Users/adib/Desktop/issue-solver/skills) as their single source of truth.
+Both surfaces live in this repository and share the exact same prompt definitions and engineering standards from [`skills/`](skills/) as their single source of truth.
 
 ---
 
@@ -62,7 +62,7 @@ Copy every directory under `skills/` into your harness's skills directory (for e
 | **Repository Scope** | Any repo (personal, forks, external open-source) | Personal GitHub account repos only (orgs and forks rejected) |
 | **Human Gates** | Human picks issue, approves brief/seams, confirms push | Human only reviews the final draft PR on GitHub (or clicks Retry / Run anyway in dashboard) |
 | **Execution Environment** | Host machine / local harness workspace | Disposable Docker runner containers (no credentials, dropped caps) |
-| **Source of Truth** | [`skills/`](file:///Users/adib/Desktop/issue-solver/skills) markdown files | Reads and inlines the exact same [`skills/`](file:///Users/adib/Desktop/issue-solver/skills) files into agent prompts |
+| **Source of Truth** | [`skills/`](skills/) markdown files | Reads and inlines the exact same [`skills/`](skills/) files into agent prompts |
 
 Both surfaces enforce the exact same engineering discipline: test-first development with red/green proof, repository-discovered conventions, and two-axis code reviews (Standards and Spec).
 
@@ -147,7 +147,7 @@ OWNER_LOGIN=octocat
 # Required: GitHub App ID from the App settings page
 GITHUB_APP_ID=123456
 
-# Required: Path to downloaded private key (defaults to ./github-app.pem)
+# Optional: Path to downloaded private key (defaults to ./github-app.pem)
 GITHUB_APP_PRIVATE_KEY_PATH=./github-app.pem
 
 # Required: Admin password for the web dashboard
@@ -156,15 +156,7 @@ ADMIN_PASSWORD=change-me-to-a-secure-password
 # Optional: Host port for dashboard (defaults to 3000)
 PORT=3000
 
-# Optional: Set to true if App has Issues write permission to comment on needs_info
-COMMENT_QUESTIONS=false
-
-# Optional: Docker GID on Linux (stat -c %g /var/run/docker.sock). Keep 0 on macOS/Windows.
-DOCKER_GID=0
-
-# Optional: Public HTTPS URL and secret (only if using webhooks)
-PUBLIC_URL=
-WEBHOOK_SECRET=
+# See .env.example for all optional settings (webhooks, issue comments, etc.)
 ```
 
 ### Step 4: Build and Start
@@ -174,14 +166,10 @@ All dependency versions in `service/package.json` and container base images (`ov
 Start the service with:
 
 ```bash
-docker compose up --build -d
+docker compose up --build
 ```
 
-Check the logs to verify startup:
-
-```bash
-docker compose logs -f controller
-```
+(Add `-d` to run in the background: `docker compose up --build -d` and view logs with `docker compose logs -f controller`).
 
 Open `http://localhost:3000` in your browser and log in as `admin` with your `ADMIN_PASSWORD`.
 
