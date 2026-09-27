@@ -20,6 +20,10 @@ export type Config = {
   port: number;
   /** Post needs_info questions as an issue comment; needs the App's Issues write permission. */
   commentQuestions: boolean;
+  /** Optional public URL; enables webhooks when paired with webhookSecret. */
+  publicUrl?: string;
+  /** GitHub App webhook secret; enables webhooks when paired with publicUrl. */
+  webhookSecret?: string;
 };
 
 export function loadConfig(env: Record<string, string | undefined>): Config {
@@ -52,5 +56,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     workspaceVolume: env.WORKSPACE_VOLUME || "auto-solve-workspaces",
     port: Number(env.PORT || 3000),
     commentQuestions: env.COMMENT_QUESTIONS === "true",
+    publicUrl: env.PUBLIC_URL?.trim() || undefined,
+    webhookSecret: env.WEBHOOK_SECRET?.trim() || undefined,
   };
 }

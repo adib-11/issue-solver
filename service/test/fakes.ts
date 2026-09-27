@@ -228,7 +228,7 @@ export async function commit(dir: string, files: Record<string, string>) {
   await $`git -C ${dir} add -A && git -C ${dir} -c user.name=t -c user.email=t@example.com commit -q -m change`;
 }
 
-export function setup() {
+export function setup(configOver: Partial<Config> = {}) {
   const dir = mkdtempSync(join(tmpdir(), "auto-solve-"));
   const github = new FakeGitHub();
   const clock = new FakeClock();
@@ -245,6 +245,7 @@ export function setup() {
     workspaceVolume: "workspaces",
     port: 0,
     commentQuestions: false,
+    ...configOver,
   };
   github.installations = [{ id: 10, account: { login: OWNER, type: "User" } }];
   const harnesses = [new FakeHarness("claude-code", "token-1"), new FakeHarness("other")];

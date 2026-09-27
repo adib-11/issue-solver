@@ -1,4 +1,5 @@
 import { $ } from "bun";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Hono } from "hono";
@@ -215,6 +216,13 @@ function candidateSkipReason(issue: Issue): (typeof FILTER_REASONS)[number] | nu
   return null;
 }
 
+function computeIntake(issue: Issue): { state: (typeof JOB_STATES)[number]; skip: string | null; reason: (typeof FILTER_REASONS)[number] | "closed" | null } {
+  const reason = issue.state === "CLOSED" ? "closed" : candidateSkipReason(issue);
+  const skip = reason ?? (TRUSTED_AUTHORS.includes(issue.authorAssociation) ? null : UNTRUSTED_AUTHOR);
+  const state = skip ? "skipped" : "queued";
+  return { state, skip, reason };
+}
+
 const PAUSE_REASONS: Partial<Record<AuthCheckState | RunError, string>> = {
   auth: "Harness auth failed: log in again as the setup page shows, then click Test auth.",
   quota: "Harness quota exhausted: wait for it to reset, then click Test auth.",
@@ -244,6 +252,9 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   const getJob = db.query<Job, [number]>("SELECT * FROM jobs WHERE id = ?");
   const upsertRepo = db.query(`INSERT INTO repos (id, full_name, installation_id) VALUES (?, ?, ?)
     ON CONFLICT (id) DO UPDATE SET full_name = excluded.full_name, installation_id = excluded.installation_id`);
+  const getDelivery = db.query<{ guid: string }, [string]>("SELECT guid FROM deliveries WHERE guid = ?");
+  const insertDelivery = db.query("INSERT INTO deliveries (guid, delivered_at) VALUES (?, ?) ON CONFLICT (guid) DO NOTHING");
+  const getJobByRepoAndNumber = db.query<Job, [number, number]>("SELECT * FROM jobs WHERE repo_id = ? AND issue_number = ?");
 
   const getSettingQuery = db.query<{ value: string }, [string]>("SELECT value FROM settings WHERE key = ?");
   const getSetting = <T>(key: string): T | null => {
@@ -272,9 +283,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
       .sort((a, b) => Date.parse(a.issue.createdAt) - Date.parse(b.issue.createdAt));
     db.transaction(() => {
       for (const { repo, issue } of found) {
-        const reason = issue.state === "CLOSED" ? "closed" : candidateSkipReason(issue);
-        const skip = reason ?? (TRUSTED_AUTHORS.includes(issue.authorAssociation) ? null : UNTRUSTED_AUTHOR);
-        const state = skip ? "skipped" : "queued";
+        const { state, skip, reason } = computeIntake(issue);
         if (reason) skipJob.run(reason, at, repo.id, issue.number);
         else liftSkip.run(state, skip, at, repo.id, issue.number);
         if (issue.state === "CLOSED") continue;
@@ -848,17 +857,157 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   }
 
   const http = new Hono();
-  http.use(basicAuth({ username: "admin", password: config.adminPassword }));
+  const webhooksEnabled = Boolean(config.publicUrl && config.webhookSecret);
+  const webhookPaths = ["/api/webhook", "/webhook"];
+
   http.use(async (c, next) => {
+    if (webhookPaths.includes(c.req.path)) {
+      if (!webhooksEnabled) return c.json({ error: "Not found" }, 404);
+      return next();
+    }
+    return basicAuth({ username: "admin", password: config.adminPassword })(c, next);
+  });
+  http.use(async (c, next) => {
+    if (webhookPaths.includes(c.req.path)) return next();
     await reconciling;
     await next();
   });
   http.use(async (c, next) => {
+    if (webhookPaths.includes(c.req.path)) return next();
     if (c.req.method !== "GET" && c.req.method !== "HEAD" && c.req.header("origin") !== new URL(c.req.url).origin) {
       return c.json({ error: "Origin does not match" }, 403);
     }
     await next();
   });
+
+  const WEBHOOK_BODY_LIMIT = 1024 * 1024;
+  if (webhooksEnabled) {
+    const handleWebhook = async (c: any) => {
+      const contentLength = Number(c.req.header("content-length"));
+      if (contentLength > WEBHOOK_BODY_LIMIT) {
+        return c.json({ error: "Payload too large" }, 413);
+      }
+      const rawBuffer = Buffer.from(await c.req.arrayBuffer());
+      if (rawBuffer.byteLength > WEBHOOK_BODY_LIMIT) {
+        return c.json({ error: "Payload too large" }, 413);
+      }
+
+      const sig = c.req.header("x-hub-signature-256");
+      if (!sig || !config.webhookSecret || !sig.startsWith("sha256=")) {
+        return c.json({ error: "Unauthorized" }, 401);
+      }
+      const computed = `sha256=${createHmac("sha256", config.webhookSecret).update(rawBuffer).digest("hex")}`;
+      const sigHash = createHash("sha256").update(sig).digest();
+      const compHash = createHash("sha256").update(computed).digest();
+      if (!timingSafeEqual(sigHash, compHash) || sig.length !== computed.length) {
+        return c.json({ error: "Unauthorized" }, 401);
+      }
+
+      let payload: any;
+      try {
+        payload = JSON.parse(rawBuffer.toString("utf8"));
+      } catch {
+        return c.json({ error: "Malformed JSON" }, 400);
+      }
+
+      const guid = c.req.header("x-github-delivery");
+      if (!guid) {
+        return c.json({ error: "Missing X-GitHub-Delivery header" }, 400);
+      }
+
+      const event = c.req.header("x-github-event");
+      if (event !== "issues" || payload?.action !== "opened") {
+        return c.body(null, 204);
+      }
+
+      const repo = payload.repository;
+      const installation = payload.installation;
+      const owner = repo?.owner;
+      if (!installation?.id || !owner || owner.type !== "User" || owner.login?.toLowerCase() !== config.ownerLogin.toLowerCase()) {
+        return c.body(null, 204);
+      }
+      if (repo.fork || repo.archived) {
+        return c.body(null, 204);
+      }
+
+      const installations = await github.listInstallations().catch(() => []);
+      const validInstallation = installations.some(
+        (inst) => inst.id === installation.id && inst.account.type === "User" && inst.account.login.toLowerCase() === config.ownerLogin.toLowerCase(),
+      );
+      if (!validInstallation) {
+        return c.body(null, 204);
+      }
+
+      const rawIssue = payload.issue;
+      if (!rawIssue || typeof rawIssue.number !== "number") {
+        return c.json({ error: "Malformed issue payload" }, 400);
+      }
+
+      const assigneesCount =
+        typeof rawIssue.assignees?.totalCount === "number"
+          ? rawIssue.assignees.totalCount
+          : Array.isArray(rawIssue.assignees)
+          ? rawIssue.assignees.length
+          : 0;
+
+      const closedByPr =
+        rawIssue.closedByPullRequestsReferences ??
+        rawIssue.closed_by_pull_requests_references ??
+        { nodes: [] };
+
+      const timelineItems =
+        rawIssue.timelineItems ??
+        rawIssue.timeline_items ??
+        { nodes: [] };
+
+      const authorAssociation =
+        rawIssue.authorAssociation ??
+        rawIssue.author_association ??
+        "NONE";
+
+      const issueObj: Issue = {
+        number: rawIssue.number,
+        title: rawIssue.title ?? `Issue ${rawIssue.number}`,
+        url: rawIssue.html_url ?? rawIssue.url ?? `https://github.com/${repo.full_name}/issues/${rawIssue.number}`,
+        state: (rawIssue.state?.toUpperCase() === "CLOSED" ? "CLOSED" : "OPEN") as "OPEN" | "CLOSED",
+        authorAssociation,
+        createdAt: rawIssue.created_at ?? rawIssue.createdAt ?? now(),
+        updatedAt: rawIssue.updated_at ?? rawIssue.updatedAt ?? now(),
+        assignees: { totalCount: assigneesCount },
+        closedByPullRequestsReferences: closedByPr,
+        timelineItems,
+      };
+
+      if (issueObj.state === "CLOSED") {
+        return c.body(null, 204);
+      }
+
+      const { state, skip } = computeIntake(issueObj);
+      const at = now();
+
+      const committed = db.transaction(() => {
+        const deliveryResult = insertDelivery.run(guid, at);
+        if (deliveryResult.changes === 0) return false;
+        if (getJobByRepoAndNumber.get(repo.id, issueObj.number)) return false;
+        upsertRepo.run(repo.id, repo.full_name, installation.id);
+        const jobResult = insertJob.run(repo.id, repo.full_name, issueObj.number, issueObj.title, issueObj.url, state, skip, at, at);
+        if (jobResult.changes === 0) return false;
+        return true;
+      })();
+
+      if (!committed) {
+        return c.body(null, 204);
+      }
+
+      if (state === "queued") {
+        void work();
+      }
+
+      return c.json({ ok: true }, 202);
+    };
+    http.post("/api/webhook", handleWebhook);
+    http.post("/webhook", handleWebhook);
+  }
 
   http.get("/api/jobs", (c) => {
     const state = c.req.query("state");
