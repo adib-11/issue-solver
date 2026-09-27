@@ -46,11 +46,15 @@ ${JSON.stringify(conventions, null, 2)}
 ${JSON.stringify(issue, null, 2)}`;
 }
 
-/** The schema cannot say "a brief or questions, never both"; this does. Returns why output is unacceptable, or null. */
+/**
+ * The schema cannot say "a brief or questions, never both"; this does. Only called on schema-valid output.
+ * Returns why output is unacceptable, or null.
+ */
 export function briefError(output: unknown) {
   const b = output as Brief;
   const filled = { brief: !!b.brief.trim(), acceptance_criteria: b.acceptance_criteria.length > 0, seams: b.seams.length > 0, questions: b.questions.length > 0 };
-  const want = b.outcome === "brief" ? { brief: true, acceptance_criteria: true, seams: true, questions: false } : { brief: false, acceptance_criteria: false, seams: false, questions: true };
+  const isBrief = b.outcome === "brief";
+  const want = { brief: isBrief, acceptance_criteria: isBrief, seams: isBrief, questions: !isBrief };
   const wrong = Object.entries(want).find(([key, value]) => filled[key as keyof typeof filled] !== value);
   return wrong ? `outcome "${b.outcome}" ${wrong[1] ? "needs" : "must not have"} ${wrong[0]}` : null;
 }

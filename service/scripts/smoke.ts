@@ -10,7 +10,7 @@ import { BRIEF_SCHEMA, BRIEF_TIMEOUT_MS, briefError, briefPrompt } from "../src/
 import { claudeCode } from "../src/claude-code";
 import { CONVENTIONS_PROMPT, CONVENTIONS_SCHEMA, CONVENTIONS_TIMEOUT_MS } from "../src/conventions";
 import type { RunOptions } from "../src/harness";
-import type { Conventions, IssueSnapshot } from "../src/jobs";
+import { type Conventions, type IssueSnapshot, TRUSTED_AUTHORS } from "../src/jobs";
 
 const [repo, number] = process.argv.slice(2);
 const token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
@@ -44,7 +44,7 @@ try {
   const issue: IssueSnapshot = {
     ...raw,
     comments: raw.comments
-      .filter((c: any) => ["OWNER", "COLLABORATOR"].includes(c.authorAssociation))
+      .filter((c: any) => TRUSTED_AUTHORS.includes(c.authorAssociation))
       .map((c: any) => ({ author: c.author.login, authorAssociation: c.authorAssociation, body: c.body })),
   };
 

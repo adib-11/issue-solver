@@ -10,14 +10,13 @@ import { CONVENTIONS_PROMPT, CONVENTIONS_SCHEMA, CONVENTIONS_TIMEOUT_MS, convent
 import { openDb } from "./db";
 import type { GitHub, Issue, Repo } from "./github";
 import { type AuthCheckState, type Harness, type RunError, type RunOptions, schemaError, type SetupView } from "./harness";
-import { type Attempt, type Brief, type Conventions, JOB_STATES, type IssueSnapshot, type Job, type JobDetail, NO_CHECKS, type Phase, type RepoView, UNTRUSTED_AUTHOR } from "./jobs";
+import { type Attempt, type Brief, type Conventions, JOB_STATES, type IssueSnapshot, type Job, type JobDetail, NO_CHECKS, type Phase, type RepoView, TRUSTED_AUTHORS, UNTRUSTED_AUTHOR } from "./jobs";
 import type { Runner } from "./runner";
 
 const PAGE_SIZE = 50;
 const SCAN_INTERVAL_MS = 60_000;
 const CURSOR_OVERLAP_MS = 60_000;
 const DIST = join(import.meta.dir, "../dist");
-const TRUSTED_AUTHORS = ["OWNER", "COLLABORATOR"];
 const STATIC_FILES: Record<string, string> = { "/": "index.html", "/app.js": "app.js", "/app.css": "app.css" };
 
 type ScannedRepo = { installationId: number; repo: Repo; issues: Issue[] };
@@ -247,7 +246,12 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     setBaseSha.run((await $`git -C ${workspace} rev-parse HEAD`.text()).trim(), attemptId);
 
     // A fresh snapshot every attempt: Retry after editing the issue briefs the edited text.
-    const fetched = await github.getIssue(repo.installation_id, repo.full_name, job.issue_number);
+    let fetched: IssueSnapshot;
+    try {
+      fetched = await github.getIssue(repo.installation_id, repo.full_name, job.issue_number);
+    } catch (err) {
+      return finish(claimed, "failed", `issue: ${redact((err as Error).message)}`);
+    }
     if (fetched.state === "CLOSED") return finish(claimed, "skipped", "skipped: closed", "closed");
     const issue: IssueSnapshot = { ...fetched, comments: fetched.comments.filter((c) => TRUSTED_AUTHORS.includes(c.authorAssociation)) };
     setIssue.run(JSON.stringify(issue), attemptId);

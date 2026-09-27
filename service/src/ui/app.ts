@@ -141,12 +141,13 @@ function renderAttempt(attempt: JobDetail["attempts"][number], number: number) {
 }
 
 /** A job action button with its hint; stays disabled once the action succeeds, until the job re-renders. */
-function jobAction(job: JobDetail, id: string, label: string, hint: string) {
-  const control = button(id, label);
+/** action is both the button's id and the job's API route segment. */
+function jobAction(job: JobDetail, action: string, label: string, hint: string) {
+  const control = button(action, label);
   const status = el("span", { role: "status", class: "text-sm text-red-800" });
   control.addEventListener("click", async () => {
     control.disabled = true;
-    const res = await fetch(`/api/jobs/${job.id}/${id}`, { method: "POST" }).catch(() => null);
+    const res = await fetch(`/api/jobs/${job.id}/${action}`, { method: "POST" }).catch(() => null);
     if (!res?.ok) {
       control.disabled = false;
       status.textContent = `${label} failed (${res ? res.status : "network error"}).`;

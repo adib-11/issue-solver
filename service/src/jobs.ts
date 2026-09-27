@@ -2,6 +2,8 @@
 export const JOB_STATES = ["queued", "running", "needs_info", "pr_created", "failed", "skipped"] as const;
 
 export const UNTRUSTED_AUTHOR = "untrusted author";
+/** Author associations whose issues and comments reach the agent without Run anyway. */
+export const TRUSTED_AUTHORS = ["OWNER", "COLLABORATOR"];
 export const NO_CHECKS = "no checks";
 
 export type Job = {
