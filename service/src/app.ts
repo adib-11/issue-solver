@@ -64,7 +64,11 @@ type ResumePlan = {
   head: string | null;
 };
 
-const phaseDone = (p: SourcePhase | undefined) => p?.outcome === "ok" || p?.outcome === "skipped";
+/** A phase counts as completed when it produced output, including one an earlier attempt carried over. */
+const phaseDone = (p: SourcePhase | undefined) => p?.outcome === "ok" || p?.outcome === "skipped" || p?.outcome === "reused";
+
+/** A source attempt with no saved bundle cannot restore its commits, so it resumes as a fresh brief. */
+const resumeStep = (step: ResumeStep, hasBundle: boolean): ResumeStep => (!hasBundle && RESUME_ORDER[step] > RESUME_ORDER.implement ? "brief" : step);
 
 /**
  * Where a failed Retry resumes and what it reuses: the first pipeline step with no completed output in the source
@@ -201,11 +205,12 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     (repo_id, repo_full_name, issue_number, issue_title, issue_url, state, skip_reason, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (repo_id, issue_number) DO NOTHING`);
-  // Filter skips follow the issue on every scan; untrusted-author skips wait for Run anyway.
+  // Filter skips follow the issue on every scan; untrusted-author skips wait for Run anyway. Either way a job put
+  // back in the queue outside Retry starts a fresh attempt, so any pending resume source is dropped.
   const filterSkipped = `state = 'skipped' AND skip_reason IN (${FILTER_REASONS.map((r) => `'${r}'`).join(", ")})`;
   const skipJob = db.query(`UPDATE jobs SET state = 'skipped', skip_reason = ?1, updated_at = ?2
     WHERE repo_id = ?3 AND issue_number = ?4 AND (state = 'queued' OR (${filterSkipped} AND skip_reason <> ?1))`);
-  const liftSkip = db.query(`UPDATE jobs SET state = ?1, skip_reason = ?2, updated_at = ?3
+  const liftSkip = db.query(`UPDATE jobs SET state = ?1, skip_reason = ?2, resume_from = NULL, updated_at = ?3
     WHERE repo_id = ?4 AND issue_number = ?5 AND ${filterSkipped}`);
   const getJob = db.query<Job, [number]>("SELECT * FROM jobs WHERE id = ?");
   const upsertRepo = db.query(`INSERT INTO repos (id, full_name, installation_id) VALUES (?, ?, ?)
@@ -569,14 +574,16 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     const source = getSourceAttempt.get(sourceId);
     if (!source) return null;
     const analysis = analyzePhases(parse<Commit[]>(source.commits) ?? [], listSourcePhases.all(sourceId));
-    // ponytail: an attempt from before bundles exist has no saved objects to restore, so it starts over fresh.
-    if (!source.bundle && RESUME_ORDER[analysis.step] > RESUME_ORDER.implement) return null;
+    const step = resumeStep(analysis.step, source.bundle !== null);
+    // ponytail: an attempt from before bundles exist has no saved objects, so the retry simply starts over.
+    if (step === "brief" && analysis.step !== "brief") return null;
     return {
       sourceId,
       baseSha: source.base_sha,
       issue: parse<IssueSnapshot>(source.issue),
       bundle: source.bundle,
       ...analysis,
+      step,
     };
   }
 
@@ -778,6 +785,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   const listPhases = db.query<Stored<Phase, "output">, [number]>(
     "SELECT name, started_at, finished_at, outcome, log, output FROM phases WHERE attempt_id = ? ORDER BY id",
   );
+  const attemptHasBundle = db.query<{ has_bundle: number }, [number]>("SELECT (bundle IS NOT NULL) AS has_bundle FROM attempts WHERE id = ?");
   http.get("/api/jobs/:id", (c) => {
     const job = getJob.get(Number(c.req.param("id")));
     if (!job) return c.json({ error: "Job not found" }, 404);
@@ -790,7 +798,8 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     }));
     // A failed job's Retry resumes where its last attempt stopped; the dashboard names that phase in the hint.
     const last = attempts[attempts.length - 1];
-    const resume_phase = job.state === "failed" && last ? analyzePhases(last.commits, listSourcePhases.all(last.id)).step : null;
+    const resume_phase =
+      job.state === "failed" && last ? resumeStep(analyzePhases(last.commits, listSourcePhases.all(last.id)).step, attemptHasBundle.get(last.id)!.has_bundle === 1) : null;
     return c.json({ ...job, attempts, resume_phase } satisfies JobDetail);
   });
 
@@ -829,7 +838,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     return c.json(repoView(getRepo.get(id)!));
   });
 
-  const runAnyway = db.query(`UPDATE jobs SET state = 'queued', skip_reason = NULL, updated_at = ?
+  const runAnyway = db.query(`UPDATE jobs SET state = 'queued', skip_reason = NULL, resume_from = NULL, updated_at = ?
     WHERE id = ? AND state = 'skipped' AND skip_reason = ?`);
   http.post("/api/jobs/:id/run-anyway", (c) => {
     const id = Number(c.req.param("id"));

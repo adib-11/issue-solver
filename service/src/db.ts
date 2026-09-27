@@ -58,7 +58,7 @@ export function openDb(path: string) {
   addColumn("attempts", "pr_url", "TEXT");
   // A git bundle of base_sha..HEAD after each commit, so a resumed attempt restores the commits with their SHAs.
   addColumn("attempts", "bundle", "BLOB");
-  // The attempt this one continued, and the phase it resumed at; both null for a fresh attempt.
+  // The attempt a resumed attempt continued; null for a fresh one. The resumed phase is derived from its phases.
   addColumn("attempts", "resumed_from", "INTEGER");
   addColumn("jobs", "resume_from", "INTEGER");
   db.run(`CREATE TABLE IF NOT EXISTS scan_cursors (

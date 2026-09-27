@@ -1315,6 +1315,32 @@ describe("resume", () => {
     expect(await remoteSha(remote, "agent/issue-1")).toBe(head);
   });
 
+  test("Retry of an attempt that was itself resumed still resumes at the failed phase", async () => {
+    const { harness } = await ready();
+    const suite = t.sandbox.script;
+    t.sandbox.script = (command, dir) => (command === "bun run typecheck" ? "timeout" : suite(command, dir));
+    harness.script = [discovered(), briefed(), implemented()];
+    await t.app.work();
+    const first = await jobFor(1);
+    const head = first.attempts[0].commits[0].sha;
+
+    await retry(first.id);
+    await t.app.work(); // no harness run: brief, implement, and red/green are reused and the checks time out again
+    const second = await jobFor(1);
+    expect(second).toMatchObject({ state: "failed", resume_phase: "checks" }); // a resumed attempt's reused phases still count
+    expect(reused(second.attempts[1])).toEqual(["brief", "implement", "red/green"]);
+    expect(second.attempts[1].commits[0].sha).toBe(head);
+
+    await retry(second.id);
+    t.sandbox.script = suite;
+    harness.script = [reviewed(), reviewed()];
+    await t.app.work();
+    const job = await jobFor(1);
+    expect(job.state).toBe("pr_created");
+    expect(reused(job.attempts[2])).toEqual(["brief", "implement", "red/green"]);
+    expect(job.attempts[2].commits[0].sha).toBe(head);
+  });
+
   test("Retry after an implement timeout reuses the saved brief and issue snapshot", async () => {
     const { harness } = await ready();
     t.github.bodies.set("octo/app#1", "Original body");
