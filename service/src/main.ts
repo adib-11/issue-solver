@@ -4,6 +4,7 @@ import { claudeCode } from "./claude-code";
 import { realClock } from "./clock";
 import { loadConfig, type Config } from "./config";
 import { createGitHubClient } from "./github";
+import { dockerRunner } from "./runner";
 
 let config: Config;
 try {
@@ -13,8 +14,10 @@ try {
   process.exit(1);
 }
 
-const harnesses = [claudeCode({ token: config.claudeOauthToken, command: [join(import.meta.dir, "../node_modules/.bin/claude")] })];
-const app = createApp({ config, github: createGitHubClient(config.appId, config.privateKey), clock: realClock, harnesses });
+// The same command runs here (Test auth) and in the runner image; both images put claude on the PATH.
+const harnesses = [claudeCode({ token: config.claudeOauthToken, command: ["claude"] })];
+const runner = dockerRunner({ image: config.runnerImage, volume: config.workspaceVolume, env: ["CLAUDE_CODE_OAUTH_TOKEN"] });
+const app = createApp({ config, github: createGitHubClient(config.appId, config.privateKey), clock: realClock, harnesses, runner });
 Bun.serve({ port: config.port, fetch: app.fetch });
 console.log(`auto-solve listening on port ${config.port}`);
 await app.start();

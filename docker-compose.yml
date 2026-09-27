@@ -10,10 +10,30 @@ services:
       GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/github_app_key
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      RUNNER_IMAGE: auto-solve-runner:local
+      WORKSPACE_VOLUME: auto-solve-workspaces
     secrets:
       - github_app_key
     volumes:
       - data:/data
+      - workspaces:/workspaces
+      # The controller starts the runner containers. Only it holds the socket; runners never get it.
+      - /var/run/docker.sock:/var/run/docker.sock
+    # The group that owns the Docker socket on the host, so the nonroot controller can use it.
+    group_add:
+      - ${DOCKER_GID:-0}
+    depends_on:
+      runner:
+        condition: service_completed_successfully
+
+  # Only builds the runner image; the controller starts one container from it per agent phase.
+  runner:
+    build:
+      context: ./service
+      dockerfile: runner.Dockerfile
+    image: auto-solve-runner:local
+    entrypoint: ["true"]
+    restart: "no"
 
 secrets:
   github_app_key:
@@ -21,3 +41,5 @@ secrets:
 
 volumes:
   data:
+  workspaces:
+    name: auto-solve-workspaces

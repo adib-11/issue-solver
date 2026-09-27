@@ -1,3 +1,4 @@
+import { $ } from "bun";
 import { createSign } from "node:crypto";
 
 export type Installation = { id: number; account: { login: string; type: string } };
@@ -41,6 +42,8 @@ export interface GitHub {
   listInstallationRepos(installationId: number): Promise<Repo[]>;
   /** Issues (not PRs) updated at or after `since` (ISO time), all states. */
   listIssues(installationId: number, repo: Repo, since: string | undefined): Promise<Issue[]>;
+  /** Clones the repo's default branch into dir. No credential is left in the clone. */
+  checkout(installationId: number, fullName: string, dir: string): Promise<void>;
 }
 
 const API = "https://api.github.com";
@@ -117,6 +120,21 @@ export function createGitHubClient(appId: string, privateKey: string): GitHub {
         after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
       } while (after);
       return issues;
+    },
+
+    async checkout(installationId, fullName, dir) {
+      const token = await installationToken(installationId);
+      const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
+      // The header goes through the environment, so it is neither on the command line nor written to .git/config.
+      const env = {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+        GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
+      };
+      const clone = await $`git -c core.hooksPath=/dev/null clone -q https://github.com/${fullName}.git ${dir}`.env(env).nothrow().quiet();
+      if (clone.exitCode !== 0) throw new Error(`git clone of ${fullName} failed: ${clone.stderr.toString().replaceAll(token, "[redacted]")}`);
     },
   };
 }

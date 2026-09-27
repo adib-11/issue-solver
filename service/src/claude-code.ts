@@ -24,12 +24,12 @@ export function claudeCode(options: { token?: string; command?: string[] }): Har
   const { token, command = ["claude"] } = options;
   const redact = (log: string) => (token ? log.replaceAll(token, "[redacted]") : log);
 
-  async function run({ prompt, schema, workspace, timeoutMs }: RunOptions): Promise<RunResult> {
+  async function run({ prompt, schema, workspace, timeoutMs, wrap = [] }: RunOptions): Promise<RunResult> {
     if (!token) return { ok: false, error: "auth", log: "CLAUDE_CODE_OAUTH_TOKEN is not set." };
     const args = ["-p", "--output-format", "stream-json", "--verbose", "--json-schema", JSON.stringify(schema), "--dangerously-skip-permissions"];
     let proc: ReturnType<typeof Bun.spawn>;
     try {
-      proc = Bun.spawn([...command, ...args], {
+      proc = Bun.spawn([...wrap, ...command, ...args], {
         cwd: workspace,
         stdin: new Blob([prompt]),
         stdout: "pipe",

@@ -1,12 +1,16 @@
+import { $ } from "bun";
+import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { basicAuth } from "hono/basic-auth";
 import type { Clock } from "./clock";
 import type { Config } from "./config";
+import { CONVENTIONS_PROMPT, CONVENTIONS_SCHEMA, CONVENTIONS_TIMEOUT_MS, conventionsHash } from "./conventions";
 import { openDb } from "./db";
 import type { GitHub, Issue, Repo } from "./github";
-import type { AuthCheckState, Harness, SetupView } from "./harness";
-import { JOB_STATES, type Job, UNTRUSTED_AUTHOR } from "./jobs";
+import { type AuthCheckState, type Harness, type RunError, type RunOptions, schemaError, type SetupView } from "./harness";
+import { type Attempt, type Conventions, JOB_STATES, type Job, type JobDetail, NO_CHECKS, type Phase, type RepoView, UNTRUSTED_AUTHOR } from "./jobs";
+import type { Runner } from "./runner";
 
 const PAGE_SIZE = 50;
 const SCAN_INTERVAL_MS = 60_000;
@@ -15,7 +19,22 @@ const DIST = join(import.meta.dir, "../dist");
 const TRUSTED_AUTHORS = ["OWNER", "COLLABORATOR"];
 const STATIC_FILES: Record<string, string> = { "/": "index.html", "/app.js": "app.js", "/app.css": "app.css" };
 
-type ScannedRepo = { repo: Repo; issues: Issue[] };
+type ScannedRepo = { installationId: number; repo: Repo; issues: Issue[] };
+type RepoRow = {
+  id: number;
+  full_name: string;
+  installation_id: number;
+  conventions: string | null;
+  conventions_hash: string | null;
+  conventions_at: string | null;
+  override: string | null;
+};
+
+const LOG_LIMIT_BYTES = 200 * 1024;
+const PIPELINE_ENDS = "Pipeline ends here: the phases after conventions are not built yet.";
+const INTERRUPTED = "Interrupted by a restart";
+// GitHub tokens and Claude tokens, wherever they come from; configured harness credentials are redacted by value too.
+const SECRET_PATTERNS = [/\bgh[pousr]_[A-Za-z0-9]{20,}/g, /\bgithub_pat_[A-Za-z0-9_]{20,}/g, /\bsk-ant-[A-Za-z0-9_-]+/g];
 const FILTER_REASONS = ["closed", "assigned", "open closing PR", "referenced by open PR"] as const;
 
 /** The skill bundle's candidate filter (skills/solve-issue/scripts/candidates.jq): work already in flight. */
@@ -27,15 +46,16 @@ function candidateSkipReason(issue: Issue): (typeof FILTER_REASONS)[number] | nu
   return null;
 }
 
-const PAUSE_REASONS: Partial<Record<AuthCheckState, string>> = {
+const PAUSE_REASONS: Partial<Record<AuthCheckState | RunError, string>> = {
   auth: "Harness auth failed: log in again as the setup page shows, then click Test auth.",
   quota: "Harness quota exhausted: wait for it to reset, then click Test auth.",
 };
 
-export function createApp(deps: { config: Config; github: GitHub; clock: Clock; harnesses: Harness[] }) {
-  const { config, github, clock, harnesses } = deps;
+export function createApp(deps: { config: Config; github: GitHub; clock: Clock; harnesses: Harness[]; runner: Runner }) {
+  const { config, github, clock, harnesses, runner } = deps;
   const db = openDb(config.dbPath);
   const iso = (ms: number) => new Date(ms).toISOString();
+  const now = () => iso(clock.now());
 
   const getCursor = db.query<{ scanned_at: string }, [number]>("SELECT scanned_at FROM scan_cursors WHERE repo_id = ?");
   const setCursor = db.query(
@@ -52,6 +72,8 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   const liftSkip = db.query(`UPDATE jobs SET state = ?1, skip_reason = ?2, updated_at = ?3
     WHERE repo_id = ?4 AND issue_number = ?5 AND ${filterSkipped}`);
   const getJob = db.query<Job, [number]>("SELECT * FROM jobs WHERE id = ?");
+  const upsertRepo = db.query(`INSERT INTO repos (id, full_name, installation_id) VALUES (?, ?, ?)
+    ON CONFLICT (id) DO UPDATE SET full_name = excluded.full_name, installation_id = excluded.installation_id`);
 
   const getSettingQuery = db.query<{ value: string }, [string]>("SELECT value FROM settings WHERE key = ?");
   const getSetting = <T>(key: string): T | null => {
@@ -74,7 +96,7 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
 
   /** Records one scan's results: every successfully listed repo, committed together so jobs are numbered oldest issue first. */
   function record(scanned: ScannedRepo[], scanStart: number) {
-    const now = iso(clock.now());
+    const at = now();
     const found = scanned
       .flatMap(({ repo, issues }) => issues.map((issue) => ({ repo, issue })))
       .sort((a, b) => Date.parse(a.issue.createdAt) - Date.parse(b.issue.createdAt));
@@ -83,19 +105,22 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
         const reason = issue.state === "CLOSED" ? "closed" : candidateSkipReason(issue);
         const skip = reason ?? (TRUSTED_AUTHORS.includes(issue.authorAssociation) ? null : UNTRUSTED_AUTHOR);
         const state = skip ? "skipped" : "queued";
-        if (reason) skipJob.run(reason, now, repo.id, issue.number);
-        else liftSkip.run(state, skip, now, repo.id, issue.number);
+        if (reason) skipJob.run(reason, at, repo.id, issue.number);
+        else liftSkip.run(state, skip, at, repo.id, issue.number);
         if (issue.state === "CLOSED") continue;
-        insertJob.run(repo.id, repo.full_name, issue.number, issue.title, issue.url, state, skip, now, now);
+        insertJob.run(repo.id, repo.full_name, issue.number, issue.title, issue.url, state, skip, at, at);
       }
-      for (const { repo } of scanned) setCursor.run(repo.id, iso(scanStart));
+      for (const { installationId, repo } of scanned) {
+        upsertRepo.run(repo.id, repo.full_name, installationId);
+        setCursor.run(repo.id, iso(scanStart));
+      }
     })();
   }
 
   async function scanRepo(installationId: number, repo: Repo): Promise<ScannedRepo> {
     const cursor = getCursor.get(repo.id)?.scanned_at;
     const since = cursor ? iso(Date.parse(cursor) - CURSOR_OVERLAP_MS) : undefined;
-    return { repo, issues: await github.listIssues(installationId, repo, since) };
+    return { installationId, repo, issues: await github.listIssues(installationId, repo, since) };
   }
 
   let scanning = false;
@@ -135,6 +160,130 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     }
   }
 
+  // Only one attempt runs at a time, so any attempt still unfinished at startup was cut off by a restart.
+  db.transaction(() => {
+    const at = now();
+    db.run("UPDATE phases SET finished_at = ?, outcome = 'interrupted' WHERE finished_at IS NULL", [at]);
+    db.run("UPDATE attempts SET finished_at = ?, result = ? WHERE finished_at IS NULL", [at, INTERRUPTED]);
+    db.run("UPDATE jobs SET state = 'failed', phase = NULL, updated_at = ? WHERE state = 'running'", [at]);
+  })();
+
+  const claimJob = db.query<Job, [string]>(`UPDATE jobs SET state = 'running', phase = 'checkout', updated_at = ?
+    WHERE id = (SELECT id FROM jobs WHERE state = 'queued' ORDER BY id LIMIT 1)
+      AND NOT EXISTS (SELECT 1 FROM jobs WHERE state = 'running')
+    RETURNING *`);
+  const insertAttempt = db.query<{ id: number }, [number, string, string]>(
+    "INSERT INTO attempts (job_id, harness, started_at) VALUES (?, ?, ?) RETURNING id",
+  );
+  const setBaseSha = db.query("UPDATE attempts SET base_sha = ? WHERE id = ?");
+  const endAttempt = db.query("UPDATE attempts SET finished_at = ?, result = ? WHERE id = ?");
+  const endJob = db.query("UPDATE jobs SET state = ?, skip_reason = ?, phase = NULL, updated_at = ? WHERE id = ?");
+  const setPhase = db.query("UPDATE jobs SET phase = ?, updated_at = ? WHERE id = ?");
+  const startPhase = db.query<{ id: number }, [number, string, string]>(
+    "INSERT INTO phases (attempt_id, name, started_at) VALUES (?, ?, ?) RETURNING id",
+  );
+  const endPhase = db.query("UPDATE phases SET finished_at = ?, outcome = ?, log = ? WHERE id = ?");
+  const getRepo = db.query<RepoRow, [number]>("SELECT * FROM repos WHERE id = ?");
+  const saveConventions = db.query("UPDATE repos SET conventions = ?, conventions_hash = ?, conventions_at = ? WHERE id = ?");
+  const parse = <T>(json: string | null): T | null => (json === null ? null : JSON.parse(json));
+
+  function redact(log: string) {
+    for (const h of harnesses) if (h.credential) log = log.replaceAll(h.credential, "[redacted]");
+    return SECRET_PATTERNS.reduce((text, pattern) => text.replace(pattern, "[redacted]"), log);
+  }
+
+  /** Keeps the last 200 KiB. Redact first, so no secret is cut in half and left half-visible. */
+  function capLog(log: string) {
+    const bytes = Buffer.from(log);
+    if (bytes.length <= LOG_LIMIT_BYTES) return log;
+    return `[earlier output truncated]\n${bytes.subarray(-LOG_LIMIT_BYTES).toString()}`;
+  }
+
+  type Claimed = { job: Job; attemptId: number; harness: Harness; workspace: string };
+
+  function finish({ job, attemptId }: Claimed, state: Job["state"], result: string, skipReason: string | null = null) {
+    db.transaction(() => {
+      endJob.run(state, skipReason, now(), job.id);
+      endAttempt.run(now(), result, attemptId);
+    })();
+  }
+
+  async function runPhase({ job, attemptId, harness, workspace }: Claimed, name: string, options: Omit<RunOptions, "workspace" | "wrap">) {
+    setPhase.run(name, now(), job.id);
+    const phase = startPhase.get(attemptId, name, now())!;
+    const result = await harness.run({ ...options, workspace, wrap: runner.command(workspace) });
+    endPhase.run(now(), result.ok ? "ok" : result.error, capLog(redact(result.log)), phase.id);
+    return result;
+  }
+
+  /** auth and quota pause dispatch and put the job back in the queue; other errors fail the job. */
+  function harnessFailed(claimed: Claimed, phase: string, error: RunError) {
+    const pause = PAUSE_REASONS[error];
+    if (pause) setSetting("paused", pause);
+    finish(claimed, pause ? "queued" : "failed", `${phase}: ${error}`);
+  }
+
+  async function runAttempt(claimed: Claimed) {
+    const { job, attemptId, workspace } = claimed;
+    const repo = getRepo.get(job.repo_id);
+    if (!repo) return finish(claimed, "failed", "The repo is no longer enabled for the GitHub App.");
+    try {
+      await github.checkout(repo.installation_id, repo.full_name, workspace);
+    } catch (err) {
+      return finish(claimed, "failed", `checkout: ${redact((err as Error).message)}`);
+    }
+    await $`git -C ${workspace} config core.hooksPath /dev/null`;
+    setBaseSha.run((await $`git -C ${workspace} rev-parse HEAD`.text()).trim(), attemptId);
+
+    let conventions = parse<Conventions>(repo.override);
+    const hash = conventions ? null : await conventionsHash(workspace);
+    if (hash && repo.conventions_hash === hash) conventions = parse<Conventions>(repo.conventions);
+    if (!conventions) {
+      const result = await runPhase(claimed, "conventions", { prompt: CONVENTIONS_PROMPT, schema: CONVENTIONS_SCHEMA, timeoutMs: CONVENTIONS_TIMEOUT_MS });
+      if (!result.ok) return harnessFailed(claimed, "conventions", result.error);
+      conventions = result.output as Conventions;
+      saveConventions.run(JSON.stringify(conventions), hash, now(), repo.id);
+    }
+    if (!conventions.check_commands.length) return finish(claimed, "skipped", `skipped: ${NO_CHECKS}`, NO_CHECKS);
+    finish(claimed, "failed", PIPELINE_ENDS);
+  }
+
+  /** Claims the oldest queued job and runs one attempt of it; false when there is nothing to do. */
+  async function runNext() {
+    const harness = harnesses.find((h) => h.name === getSetting("harness"));
+    if (!harness || getSetting("paused")) return false;
+    const claimed = db.transaction((): Claimed | null => {
+      const job = claimJob.get(now());
+      if (!job) return null;
+      const attemptId = insertAttempt.get(job.id, harness.name, now())!.id;
+      return { job, attemptId, harness, workspace: join(config.workspacesDir, `attempt-${attemptId}`) };
+    })();
+    if (!claimed) return false;
+    try {
+      await runAttempt(claimed);
+    } catch (err) {
+      console.error(`Attempt ${claimed.attemptId} failed:`, err);
+      finish(claimed, "failed", `Internal error: ${redact((err as Error).message)}`);
+    } finally {
+      await runner.cleanup().catch((err) => console.error("Runner cleanup failed:", err));
+      rmSync(claimed.workspace, { recursive: true, force: true });
+    }
+    return true;
+  }
+
+  let working: Promise<void> | undefined;
+  /** Works through the queue; a call while it is already working joins that run. */
+  function work() {
+    working ??= (async () => {
+      try {
+        while (await runNext());
+      } finally {
+        working = undefined;
+      }
+    })();
+    return working;
+  }
+
   const http = new Hono();
   http.use(basicAuth({ username: "admin", password: config.adminPassword }));
   http.use(async (c, next) => {
@@ -159,9 +308,37 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     return c.json({ jobs, page, pageSize: PAGE_SIZE, total });
   });
 
+  const listAttempts = db.query<Omit<Attempt, "phases">, [number]>(
+    "SELECT id, harness, base_sha, started_at, finished_at, result FROM attempts WHERE job_id = ? ORDER BY id",
+  );
+  const listPhases = db.query<Phase, [number]>("SELECT name, started_at, finished_at, outcome, log FROM phases WHERE attempt_id = ? ORDER BY id");
   http.get("/api/jobs/:id", (c) => {
     const job = getJob.get(Number(c.req.param("id")));
-    return job ? c.json(job) : c.json({ error: "Job not found" }, 404);
+    if (!job) return c.json({ error: "Job not found" }, 404);
+    const attempts = listAttempts.all(job.id).map((a) => ({ ...a, phases: listPhases.all(a.id) }));
+    return c.json({ ...job, attempts } satisfies JobDetail);
+  });
+
+  const listRepos = db.query<RepoRow, []>("SELECT * FROM repos ORDER BY full_name");
+  const setOverride = db.query("UPDATE repos SET override = ? WHERE id = ?");
+  const repoView = (row: RepoRow): RepoView => ({
+    id: row.id,
+    full_name: row.full_name,
+    discovered: parse(row.conventions),
+    discovered_at: row.conventions_at,
+    override: parse(row.override),
+  });
+  http.get("/api/repos", (c) => c.json(listRepos.all().map(repoView)));
+
+  /** Body: the conventions to use instead of discovered ones, or null to clear the override. */
+  http.put("/api/repos/:id/override", async (c) => {
+    const id = Number(c.req.param("id"));
+    if (!getRepo.get(id)) return c.json({ error: "Repo not found" }, 404);
+    const body = await c.req.json().catch(() => undefined);
+    const invalid = body === undefined ? "Body must be JSON" : body === null ? null : schemaError(CONVENTIONS_SCHEMA, body);
+    if (invalid) return c.json({ error: invalid }, 400);
+    setOverride.run(body === null ? null : JSON.stringify(body), id);
+    return c.json(repoView(getRepo.get(id)!));
   });
 
   const runAnyway = db.query(`UPDATE jobs SET state = 'queued', skip_reason = NULL, updated_at = ?
@@ -217,9 +394,18 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   return {
     fetch: (req: Request) => http.fetch(req),
     scan,
+    work,
     async start() {
+      // Leftovers of attempts cut off by a restart.
+      await runner.cleanup().catch((err) => console.error("Runner cleanup failed:", err));
+      mkdirSync(config.workspacesDir, { recursive: true });
+      for (const entry of readdirSync(config.workspacesDir)) rmSync(join(config.workspacesDir, entry), { recursive: true, force: true });
       await scan();
-      stopTimer = clock.every(SCAN_INTERVAL_MS, scan);
+      void work();
+      stopTimer = clock.every(SCAN_INTERVAL_MS, async () => {
+        await scan();
+        await work();
+      });
     },
     stop() {
       stopTimer?.();

@@ -8,6 +8,11 @@ export type Config = {
   /** Subscription token from `claude setup-token`; optional because the harness is chosen on the setup page. */
   claudeOauthToken?: string;
   dbPath: string;
+  /** Per-attempt checkouts; the workspaces volume is mounted here. */
+  workspacesDir: string;
+  runnerImage: string;
+  /** The Docker volume mounted at workspacesDir, which runner containers mount a subpath of. */
+  workspaceVolume: string;
   port: number;
 };
 
@@ -34,6 +39,9 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     adminPassword,
     claudeOauthToken: env.CLAUDE_CODE_OAUTH_TOKEN?.trim() || undefined,
     dbPath: env.DB_PATH || "/data/auto-solve.sqlite",
+    workspacesDir: env.WORKSPACES_DIR || "/workspaces",
+    runnerImage: env.RUNNER_IMAGE || "auto-solve-runner:local",
+    workspaceVolume: env.WORKSPACE_VOLUME || "auto-solve-workspaces",
     port: Number(env.PORT || 3000),
   };
 }
