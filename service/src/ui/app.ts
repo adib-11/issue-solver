@@ -147,12 +147,19 @@ function renderReview(phase: JobDetail["attempts"][number]["phases"][number]) {
   return [];
 }
 
-function renderAttempt(attempt: JobDetail["attempts"][number], number: number) {
+function renderAttempt(attempt: JobDetail["attempts"][number], number: number, allAttempts: JobDetail["attempts"]) {
   const brief = attempt.phases.find((p) => p.name === "brief" && p.output)?.output as Brief | undefined;
+  const sourceNumber =
+    attempt.resumed_from === null ? null : (allAttempts.findIndex((a) => a.id === attempt.resumed_from) + 1 || attempt.resumed_from);
+  const firstNewPhase = attempt.phases.find((p) => p.outcome !== "reused");
+  const resumedPhase = firstNewPhase ? (firstNewPhase.name.startsWith("review/") ? "review" : firstNewPhase.name) : "publish";
   return section(
     `Attempt ${number} (${attempt.harness})`,
     el("p", { class: "text-sm text-slate-600" }, "Started ", time(attempt.started_at), ...(attempt.finished_at ? [", finished ", time(attempt.finished_at)] : [])),
     el("p", { class: "my-2 break-words", textContent: attempt.result ?? "Running…" }),
+    ...(sourceNumber === null
+      ? []
+      : [el("p", { class: "my-2 break-words", textContent: `Resumed from attempt ${sourceNumber} at ${resumedPhase}` })]),
     ...[
       ["Pull request", attempt.pr_url],
       ["Branch", attempt.branch_url],
@@ -198,13 +205,21 @@ function jobAction(job: JobDetail, action: string, label: string, hint: string) 
   return el("div", { class: "mt-3 flex flex-wrap items-center gap-2" }, el("span", { class: "text-sm text-slate-600", textContent: hint }), control, status);
 }
 
+function jobPrimaryAction(job: JobDetail): HTMLElement | null {
+  if (job.state === "skipped" && job.skip_reason === UNTRUSTED_AUTHOR) {
+    return jobAction(job, "run-anyway", "Run anyway", "Read the issue first: its author is not you or a collaborator.");
+  }
+  if (job.state === "needs_info") {
+    return jobAction(job, "retry", "Retry", "Answer the questions by editing the issue, then retry: the brief starts over from the edited issue.");
+  }
+  if (job.state === "failed") {
+    return jobAction(job, "retry", "Retry", `Retry resumes at the ${job.resume_phase ?? "failed"} phase with the saved commits.`);
+  }
+  return null;
+}
+
 function renderJob(content: HTMLElement, job: JobDetail) {
-  const action =
-    job.state === "skipped" && job.skip_reason === UNTRUSTED_AUTHOR
-      ? jobAction(job, "run-anyway", "Run anyway", "Read the issue first: its author is not you or a collaborator.")
-      : job.state === "needs_info"
-        ? jobAction(job, "retry", "Retry", "Answer the questions by editing the issue, then retry: the brief starts over from the edited issue.")
-        : null;
+  const action = jobPrimaryAction(job);
   const row = (label: string, value: Child) =>
     el("div", { class: "grid gap-1 py-2 sm:grid-cols-[10rem_1fr]" }, el("dt", { class: "text-slate-500", textContent: label }), el("dd", { class: "break-words" }, value));
   content.replaceChildren(
@@ -220,7 +235,7 @@ function renderJob(content: HTMLElement, job: JobDetail) {
       row("Updated", time(job.updated_at)),
     ),
     ...(action ? [action] : []),
-    el("div", { class: "mt-3 flex flex-col gap-3" }, ...[...job.attempts].reverse().map((a, i) => renderAttempt(a, job.attempts.length - i))),
+    el("div", { class: "mt-3 flex flex-col gap-3" }, ...[...job.attempts].reverse().map((a, i) => renderAttempt(a, job.attempts.length - i, job.attempts))),
   );
 }
 

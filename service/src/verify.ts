@@ -15,7 +15,8 @@ const failed = ({ command, exitCode, log }: SandboxRun, how = `exited ${exitCode
 
 /**
  * Runs setup and commands in the sandbox on a fresh clone of the workspace at sha, with the overlay's files taken
- * from its commit. The sandbox never sees the workspace itself, so a check cannot tamper with the checkout.
+ * from its commit. The sandbox never sees the workspace itself, so a check cannot tamper with the checkout. The
+ * timeoutMs is the phase's limit, already clamped to what the attempt's hard cap has left.
  */
 async function inSandbox(
   sandbox: Sandbox,
@@ -24,14 +25,15 @@ async function inSandbox(
   sha: string,
   setup: string,
   commands: string[],
-  overlay?: { sha: string; files: string[] },
+  opts: { timeoutMs: number; overlay?: { sha: string; files: string[] } },
 ) {
   const dir = `${workspace}-check`;
+  const { timeoutMs, overlay } = opts;
   rmSync(dir, { recursive: true, force: true });
   try {
     await $`git clone -q --no-checkout ${workspace} ${dir} && git -C ${dir} checkout -q --detach ${sha}`.quiet();
     if (overlay) await $`git -C ${dir} checkout -q ${overlay.sha} -- ${overlay.files}`.quiet();
-    const { runs, timedOut } = await sandbox.run(dir, setup, commands, CHECKS_TIMEOUT_MS);
+    const { runs, timedOut } = await sandbox.run(dir, setup, commands, timeoutMs);
     return {
       runs,
       timedOut,
@@ -48,12 +50,12 @@ async function inSandbox(
  * single-test-file command when there is one, else the full check on base, whose passing on head the checks prove.
  * Failing to compile on base counts as red.
  */
-export async function redGreen(sandbox: Sandbox, workspace: string, base: string, head: string, conventions: Conventions, testFiles: string[]): Promise<Verified> {
+export async function redGreen(sandbox: Sandbox, workspace: string, base: string, head: string, conventions: Conventions, testFiles: string[], timeoutMs: number): Promise<Verified> {
   if (!conventions.has_tests) return { output: { runs: [], skipped: "the repo has no tests, so there are no new tests to prove" }, log: "", error: null };
   const files = [...new Set(testFiles)];
   const { setup_command: setup, test_file_command: template } = conventions;
   const commands = template ? files.map((f) => template.replaceAll("{file}", quote(f))) : conventions.check_commands;
-  const red = await inSandbox(sandbox, workspace, "base", base, setup, commands, { sha: head, files });
+  const red = await inSandbox(sandbox, workspace, "base", base, setup, commands, { timeoutMs, overlay: { sha: head, files } });
   const result = (error: string | null, green?: typeof red): Verified => ({
     output: { runs: [...red.output, ...(green?.output ?? [])] },
     log: red.log + (green?.log ?? ""),
@@ -67,16 +69,16 @@ export async function redGreen(sandbox: Sandbox, workspace: string, base: string
   const passing = tests.find((r) => !r.exitCode);
   if (passing) return result(`tautological test: \`${passing.command}\` passes on base`);
 
-  const green = await inSandbox(sandbox, workspace, "head", head, setup, commands);
+  const green = await inSandbox(sandbox, workspace, "head", head, setup, commands, { timeoutMs });
   if (green.timedOut) return result("timeout", green);
   const broken = green.runs.find((r) => r.exitCode);
   if (!broken) return result(null, green);
   return result(failed(broken, setup && broken === green.runs[0] ? `exited ${broken.exitCode} on head` : "fails on the change"), green);
 }
 
-/** Runs setup and every check command on head; any non-zero exit fails. */
-export async function checks(sandbox: Sandbox, workspace: string, head: string, conventions: Conventions): Promise<Verified> {
-  const { runs, timedOut, output, log } = await inSandbox(sandbox, workspace, "head", head, conventions.setup_command, conventions.check_commands);
+/** Runs setup and every check command on head; any non-zero exit fails. timeoutMs is the phase's clamped limit. */
+export async function checks(sandbox: Sandbox, workspace: string, head: string, conventions: Conventions, timeoutMs: number): Promise<Verified> {
+  const { runs, timedOut, output, log } = await inSandbox(sandbox, workspace, "head", head, conventions.setup_command, conventions.check_commands, { timeoutMs });
   const broken = runs.find((r) => r.exitCode);
   return { output: { runs: output }, log, error: timedOut ? "timeout" : broken ? failed(broken) : null };
 }
