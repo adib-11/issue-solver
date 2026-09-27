@@ -76,6 +76,18 @@ export type CommandRun = { on: "base" | "head"; command: string; exit_code: numb
 /** The red/green and checks phases' output. */
 export type CommandRuns = { runs: CommandRun[]; /** Why the phase was skipped, when it was. */ skipped?: string };
 
+/** One finding from a review axis. */
+export type Finding = { id: string; kind: string; quote: string; rationale: string };
+
+/** The fix phase's verdict on one finding. */
+export type Decision = { id: string; decision: "fixed" | "rejected"; reason: string };
+
+/**
+ * One round of the review loop: both axes' findings and the fix decisions on them. decisions is empty when the
+ * round found nothing or when the round cap stopped the loop before fixing, leaving its findings open.
+ */
+export type ReviewRound = { standards: Finding[]; spec: Finding[]; decisions: Decision[] };
+
 export type Phase = {
   name: string;
   started_at: string;

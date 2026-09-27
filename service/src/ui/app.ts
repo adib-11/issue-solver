@@ -1,6 +1,6 @@
 // Dashboard. Everything from the API is rendered with textContent only; see scripts/no-html-insertion.sh.
 import type { AuthCheckState, SetupView as Setup } from "../harness";
-import { type Brief, type CommandRuns, type Conventions, JOB_STATES, type Job, type JobDetail, type RepoView, UNTRUSTED_AUTHOR } from "../jobs";
+import { type Brief, type CommandRuns, type Conventions, type Decision, type Finding, JOB_STATES, type Job, type JobDetail, type RepoView, UNTRUSTED_AUTHOR } from "../jobs";
 
 type JobPage = { jobs: Job[]; page: number; pageSize: number; total: number };
 
@@ -131,6 +131,22 @@ function renderRuns(phase: JobDetail["attempts"][number]["phases"][number]) {
   return [list("Commands", output.runs.map((r) => `${r.on === "base" ? "on base, with the new tests" : "on the change"}: ${r.command} → exit ${r.exit_code}`))];
 }
 
+/** A review axis's findings and the fix phase's decisions; the phases' order shows the rounds. */
+function renderReview(phase: JobDetail["attempts"][number]["phases"][number]) {
+  if (phase.name === "review/standards" || phase.name === "review/spec") {
+    const output = phase.output as { findings: Finding[] } | null;
+    if (!output) return [];
+    if (!output.findings.length) return [el("p", { class: "my-2 text-slate-600", textContent: "No findings." })];
+    return [list("Findings", output.findings.map((f) => `${f.id} (${f.kind}): ${f.rationale} — ${f.quote}`))];
+  }
+  if (phase.name === "fix") {
+    const output = phase.output as { decisions: Decision[] } | null;
+    if (!output) return [];
+    return [list("Decisions", output.decisions.map((d) => `${d.id}: ${d.decision} — ${d.reason}`))];
+  }
+  return [];
+}
+
 function renderAttempt(attempt: JobDetail["attempts"][number], number: number) {
   const brief = attempt.phases.find((p) => p.name === "brief" && p.output)?.output as Brief | undefined;
   return section(
@@ -158,6 +174,7 @@ function renderAttempt(attempt: JobDetail["attempts"][number], number: number) {
         { class: "border-t border-slate-200 py-2" },
         el("summary", { class: `cursor-pointer ${focusRing}`, textContent: `${phase.name}: ${phase.outcome ?? "running"}` }),
         ...renderRuns(phase),
+        ...renderReview(phase),
         pre(phase.log || "(no output)"),
       ),
     ),

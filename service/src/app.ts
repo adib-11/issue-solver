@@ -8,11 +8,12 @@ import type { Config } from "./config";
 import { BRIEF_SCHEMA, BRIEF_TIMEOUT_MS, briefError, briefPrompt, questionsComment } from "./brief";
 import { CONVENTIONS_PROMPT, CONVENTIONS_SCHEMA, CONVENTIONS_TIMEOUT_MS, conventionsHash } from "./conventions";
 import { openDb } from "./db";
-import { changeError, commitChange, gitConfigHash, IMPLEMENT_SCHEMA, IMPLEMENT_TIMEOUT_MS, type Implemented, implementError, implementPrompt } from "./implement";
+import { changeError, commitChange, gitConfigHash, IMPLEMENT_SCHEMA, IMPLEMENT_TIMEOUT_MS, type Implemented, implementError, implementPrompt, stageChange } from "./implement";
 import type { GitHub, Issue, Repo } from "./github";
 import { branchFor, prBody, prTitle } from "./publish";
 import { type AuthCheckState, type Harness, type RunError, type RunOptions, schemaError, type SetupView } from "./harness";
-import { type Attempt, type Brief, type CommandRuns, type Commit, type Conventions, JOB_STATES, type IssueSnapshot, type Job, type JobDetail, NO_CHECKS, type Phase, type RepoView, TRUSTED_AUTHORS, UNTRUSTED_AUTHOR } from "./jobs";
+import { type Attempt, type Brief, type CommandRuns, type Commit, type Conventions, JOB_STATES, type IssueSnapshot, type Job, type JobDetail, NO_CHECKS, type Phase, type RepoView, type ReviewRound, TRUSTED_AUTHORS, UNTRUSTED_AUTHOR } from "./jobs";
+import { FIX_SCHEMA, FIX_TIMEOUT_MS, fixError, fixPrompt, REVIEW_ROUNDS, REVIEW_SCHEMA, REVIEW_TIMEOUT_MS, type Fixed, type Reviewed, specPrompt, standardsPrompt } from "./review";
 import type { Runner, Sandbox } from "./runner";
 import { checks, redGreen, type Verified } from "./verify";
 
@@ -306,6 +307,67 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     finish(claimed, pause ? "queued" : "failed", `${phase}: ${error}`);
   }
 
+  /**
+   * The review loop: up to REVIEW_ROUNDS rounds, each a fresh Standards review and a fresh Spec review. The fix
+   * phase decides every finding and its commit is re-checked. The loop ends when a round finds nothing or fixes
+   * nothing, or at the round cap, whose findings stay open for the PR. null when the attempt failed.
+   */
+  async function reviewLoop(
+    claimed: Claimed,
+    baseSha: string,
+    configHash: string,
+    commits: Commit[],
+    conventions: Conventions,
+    issue: IssueSnapshot,
+    brief: Brief,
+  ): Promise<{ rounds: ReviewRound[]; head: string } | null> {
+    const { workspace } = claimed;
+    const rounds: ReviewRound[] = [];
+    let head = commits[commits.length - 1]!.sha;
+    while (rounds.length < REVIEW_ROUNDS) {
+      const standards = await runPhase(claimed, "review/standards", { prompt: standardsPrompt(baseSha, commits, conventions), schema: REVIEW_SCHEMA, timeoutMs: REVIEW_TIMEOUT_MS });
+      if (!standards.ok) {
+        harnessFailed(claimed, "review/standards", standards.error);
+        return null;
+      }
+      const spec = await runPhase(claimed, "review/spec", { prompt: specPrompt(baseSha, commits, brief, issue), schema: REVIEW_SCHEMA, timeoutMs: REVIEW_TIMEOUT_MS });
+      if (!spec.ok) {
+        harnessFailed(claimed, "review/spec", spec.error);
+        return null;
+      }
+      const round: ReviewRound = { standards: (standards.output as Reviewed).findings, spec: (spec.output as Reviewed).findings, decisions: [] };
+      rounds.push(round);
+      const findings = [...round.standards, ...round.spec];
+      if (!findings.length) break; // a clean round ends the loop
+      if (rounds.length >= REVIEW_ROUNDS) break; // the cap: these findings stay open
+
+      const fixed = await runPhase(
+        claimed,
+        "fix",
+        { prompt: fixPrompt(baseSha, commits, conventions, findings), schema: FIX_SCHEMA, timeoutMs: FIX_TIMEOUT_MS },
+        (output) => fixError(output, findings),
+      );
+      if (!fixed.ok) {
+        harnessFailed(claimed, "fix", fixed.error);
+        return null;
+      }
+      round.decisions = (fixed.output as Fixed).decisions;
+      const staged = await stageChange(workspace, head, configHash);
+      if ("error" in staged) {
+        finish(claimed, "failed", `fix: ${staged.error}`);
+        return null;
+      }
+      if (!staged.changed.length) break; // a round that fixed nothing ends the loop
+      const fix = await commitChange(workspace, (fixed.output as Fixed).commit_message);
+      addCommit.run(JSON.stringify(fix), claimed.attemptId);
+      commits.push(fix);
+      head = fix.sha;
+      const rechecked = await verifyPhase(claimed, "checks", () => checks(sandbox, workspace, head, conventions));
+      if (!rechecked) return null; // failing checks after the loop fail the attempt, with no PR
+    }
+    return { rounds, head };
+  }
+
   async function runAttempt(claimed: Claimed) {
     const { job, attemptId, workspace } = claimed;
     const repo = getRepo.get(job.repo_id);
@@ -376,8 +438,10 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
     if (!redGreenRuns) return;
     const checkRuns = await verifyPhase(claimed, "checks", () => checks(sandbox, workspace, head.sha, conventions));
     if (!checkRuns) return;
-    const body = prBody({ issue, brief, implemented: implemented.output as Implemented, redGreen: redGreenRuns, checks: checkRuns, harness: claimed.harness.label });
-    await publish(claimed, repo, head.sha, prTitle(issue, conventions, commit_message), body);
+    const review = await reviewLoop(claimed, baseSha, configHash, [head], conventions, issue, brief);
+    if (!review) return;
+    const body = prBody({ issue, brief, implemented: implemented.output as Implemented, redGreen: redGreenRuns, checks: checkRuns, review: review.rounds, harness: claimed.harness.label });
+    await publish(claimed, repo, review.head, prTitle(issue, conventions, commit_message), body);
   }
 
   /** Claims the oldest queued job and runs one attempt of it; false when there is nothing to do. */

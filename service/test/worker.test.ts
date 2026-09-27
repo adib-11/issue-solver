@@ -4,6 +4,8 @@ import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync
 import { dirname, join } from "node:path";
 import { CONVENTIONS_PROMPT } from "../src/conventions";
 import type { RunOptions, RunResult } from "../src/harness";
+import { REVIEW_TIMEOUT_MS } from "../src/review";
+import type { Decision, Finding } from "../src/jobs";
 import { commit, issue, repo, setup } from "./fakes";
 
 let t: ReturnType<typeof setup>;
@@ -43,8 +45,10 @@ const implemented =
     }
     return { ok: true, output, log: "implement log" };
   };
-/** A job's brief and implement phases, both succeeding. */
-const solved = () => [briefed(), implemented()];
+const CLEAN = { findings: [] };
+const reviewed = (output: unknown = CLEAN): (() => RunResult) => () => ({ ok: true, output, log: "review log" });
+/** A job's brief, implement, and the two clean review phases, all succeeding. */
+const solved = () => [briefed(), implemented(), reviewed(), reviewed()];
 
 /** A chosen harness, one repo with a checkout-able remote, and these issues queued. */
 async function ready(issues = [issue(1)]) {
@@ -119,6 +123,8 @@ describe("worker", () => {
           { name: "implement", outcome: "ok", log: "implement log" },
           { name: "red/green", outcome: "ok" },
           { name: "checks", outcome: "ok" },
+          { name: "review/standards", outcome: "ok", log: "review log" },
+          { name: "review/spec", outcome: "ok", log: "review log" },
           { name: "publish", outcome: "ok" },
         ],
       },
@@ -167,7 +173,7 @@ describe("conventions", () => {
     harness.script = [discovered(), ...solved(), ...solved()];
     await t.app.work();
     expect(harness.runs.filter((r) => r.prompt === CONVENTIONS_PROMPT)).toHaveLength(1);
-    expect((await jobFor(2)).attempts[0].phases.map((p: any) => p.name)).toEqual(["brief", "implement", "red/green", "checks", "publish"]);
+    expect((await jobFor(2)).attempts[0].phases.map((p: any) => p.name)).toEqual(["brief", "implement", "red/green", "checks", "review/standards", "review/spec", "publish"]);
     expect(await t.json("/api/repos")).toEqual([
       { id: 1, full_name: "octo/app", discovered: CONVENTIONS, discovered_at: "2026-01-01T00:00:00.000Z", override: null },
     ]);
@@ -212,7 +218,7 @@ describe("conventions", () => {
     await t.app.work();
     expect((await jobFor(2)).state).toBe("skipped");
     expect((await jobFor(2)).skip_reason).toBe("no checks");
-    expect(harness.runs).toHaveLength(3);
+    expect(harness.runs).toHaveLength(5);
 
     expect((await t.post("/api/repos/1/override", null, "PUT")).status).toBe(200);
     await addIssue(3);
@@ -225,7 +231,7 @@ describe("conventions", () => {
     await t.post("/api/repos/1/override", CONVENTIONS, "PUT");
     harness.script = [...solved()];
     await t.app.work();
-    expect((await jobFor(1)).attempts[0]).toMatchObject({ result: expect.stringMatching(/^pr_created: /), phases: [{ name: "brief" }, { name: "implement" }, { name: "red/green" }, { name: "checks" }, { name: "publish" }] });
+    expect((await jobFor(1)).attempts[0]).toMatchObject({ result: expect.stringMatching(/^pr_created: /), phases: [{ name: "brief" }, { name: "implement" }, { name: "red/green" }, { name: "checks" }, { name: "review/standards" }, { name: "review/spec" }, { name: "publish" }] });
   });
 
   test("an invalid override is refused, as is an unknown repo", async () => {
@@ -308,7 +314,7 @@ test("a restart fails the interrupted attempt and cleans up runners, so the queu
   expect(t.runner.cleanups).toBeGreaterThan(cleanups);
   expect(existsSync(harness.runs[0]!.workspace)).toBe(false);
   await t.app.work();
-  expect(harness.runs).toHaveLength(4);
+  expect(harness.runs).toHaveLength(6);
   expect((await jobFor(2)).attempts[0].result).toStartWith("pr_created: ");
 });
 
@@ -419,7 +425,7 @@ describe("brief", () => {
     const job = await jobFor(1);
     expect(job.attempts).toHaveLength(2);
     expect(job.attempts[1].issue.body).toBe("Clarified: the /users endpoint returns 500.");
-    expect(job.attempts[1].phases.map((p: any) => p.name)).toEqual(["brief", "implement", "red/green", "checks", "publish"]);
+    expect(job.attempts[1].phases.map((p: any) => p.name)).toEqual(["brief", "implement", "red/green", "checks", "review/standards", "review/spec", "publish"]);
     expect(harness.runs[2]!.prompt).toContain("Clarified: the /users endpoint returns 500.");
     expect((await t.post(`/api/jobs/${id}/retry`)).status).toBe(409);
   });
@@ -470,7 +476,7 @@ describe("implement", () => {
 
   test("the controller commits the change with the phase's message, and job detail shows the commit and its diff stat", async () => {
     const { harness } = await ready();
-    harness.script = [discovered(), briefed(), implemented()];
+    harness.script = [discovered(), briefed(), implemented(), reviewed(), reviewed()];
     await t.app.work();
     const attempt = (await jobFor(1)).attempts[0];
     expect(attempt.result).toStartWith("pr_created: ");
@@ -495,6 +501,8 @@ describe("implement", () => {
         await $`git -C ${options.workspace} add -A && git -C ${options.workspace} -c user.name=agent -c user.email=a@example.com commit -q -m sneaky`;
         return result;
       },
+      reviewed(),
+      reviewed(),
     ];
     await t.app.work();
     const { commits, result } = (await jobFor(1)).attempts[0];
@@ -542,7 +550,7 @@ describe("implement", () => {
 
   test("a repo without tests needs none: a change with no tests is committed", async () => {
     const { harness } = await ready();
-    harness.script = [discovered({ ...CONVENTIONS, has_tests: false, test_file_command: "" }), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] })];
+    harness.script = [discovered({ ...CONVENTIONS, has_tests: false, test_file_command: "" }), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] }), reviewed(), reviewed()];
     await t.app.work();
     const { result, commits } = (await jobFor(1)).attempts[0];
     expect(result).toStartWith("pr_created: ");
@@ -623,6 +631,8 @@ describe("red/green and checks", () => {
         writeFileSync(join(options.workspace, "scratch.txt"), "not committed");
         return result;
       },
+      reviewed(),
+      reviewed(),
     ];
     await t.app.work();
     expect((await jobFor(1)).attempts[0].result).toStartWith("pr_created: ");
@@ -654,7 +664,7 @@ describe("red/green and checks", () => {
   test("a test file path is shell-quoted into the single-test-file command", async () => {
     const { harness } = await ready();
     const file = "test/it's f.test.ts";
-    harness.script = [discovered(), briefed(), implemented({ ...CHANGE, [file]: "x" }, { ...IMPLEMENTED, tests_added: [{ file, name: "f" }] })];
+    harness.script = [discovered(), briefed(), implemented({ ...CHANGE, [file]: "x" }, { ...IMPLEMENTED, tests_added: [{ file, name: "f" }] }), reviewed(), reviewed()];
     await t.app.work();
     const runs = (await jobFor(1)).attempts[0].phases.find((p: any) => p.name === "red/green").output.runs;
     expect(runs[1]).toEqual({ on: "base", command: `bun test 'test/it'\\''s f.test.ts'`, exit_code: 1 });
@@ -685,7 +695,7 @@ describe("red/green and checks", () => {
 
   test("a repo without tests skips red/green and records it; the checks still run", async () => {
     const { harness } = await ready();
-    harness.script = [discovered(noTests), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] })];
+    harness.script = [discovered(noTests), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] }), reviewed(), reviewed()];
     await t.app.work();
     const attempt = (await jobFor(1)).attempts[0];
     expect(attempt.result).toStartWith("pr_created: ");
@@ -739,7 +749,7 @@ describe("red/green and checks", () => {
   test("a failing setup fails the attempt naming it", async () => {
     const { harness } = await ready();
     t.sandbox.script = (command) => (command === "bun install" ? { exitCode: 1, log: "lockfile mismatch" } : 0);
-    harness.script = [discovered(noTests), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] })];
+    harness.script = [discovered(noTests), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] }), reviewed(), reviewed()];
     await t.app.work();
     const attempt = (await jobFor(1)).attempts[0];
     expect(attempt.result).toMatch(/^checks: `bun install` exited 1:\nlockfile mismatch$/);
@@ -749,7 +759,7 @@ describe("red/green and checks", () => {
   test("a sandbox timeout fails the attempt naming the phase", async () => {
     const { harness } = await ready();
     t.sandbox.script = (command) => (command === "bun run typecheck" ? "timeout" : 0);
-    harness.script = [discovered(noTests), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] })];
+    harness.script = [discovered(noTests), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] }), reviewed(), reviewed()];
     await t.app.work();
     const attempt = (await jobFor(1)).attempts[0];
     expect(attempt.result).toBe("checks: timeout");
@@ -807,7 +817,7 @@ describe("publish", () => {
 
   test("a repo without tests says so in the PR body", async () => {
     const { harness } = await ready();
-    harness.script = [discovered({ ...CONVENTIONS, has_tests: false, test_file_command: "" }), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] })];
+    harness.script = [discovered({ ...CONVENTIONS, has_tests: false, test_file_command: "" }), briefed(), implemented({ "src/f.ts": "x" }, { ...IMPLEMENTED, tests_added: [] }), reviewed(), reviewed()];
     await t.app.work();
     expect(t.github.pulls[0]!.body).toContain("the repo has no tests");
   });
@@ -840,6 +850,8 @@ describe("publish", () => {
         t.github.issues.get(1)![0]!.state = "CLOSED";
         return implemented()(options);
       },
+      reviewed(),
+      reviewed(),
     ];
     await t.app.work();
     expect(await jobFor(1)).toMatchObject({ state: "skipped", skip_reason: "closed" });
@@ -880,5 +892,199 @@ describe("publish", () => {
     expect(job.state).toBe("failed");
     expect(job.attempts[0].result).toBe("publish: GitHub 502");
     expect(job.attempts[0].phases.at(-1)).toMatchObject({ name: "publish", outcome: "failed" });
+  });
+});
+
+describe("review loop", () => {
+  const skillBody = readFileSync(join(import.meta.dir, "../../skills/code-review/SKILL.md"), "utf8").split("\n---\n").slice(1).join("\n---\n").trim();
+  const STANDARD: Finding = { id: "S1", kind: "possible Duplicated Code", quote: "const x = 1;", rationale: "the same expression appears twice" };
+  const SPEC: Finding = { id: "P1", kind: "missing requirement", quote: "- [ ] `f(0)` throws", rationale: "the brief asks that `f(0)` throw" };
+  const reviewing = (finding?: Finding) => reviewed({ findings: finding ? [finding] : [] });
+  /** The fix phase: writes files into the workspace and reports its decisions. */
+  const fixing =
+    (files: Record<string, string>, decisions: Decision[], commit_message = "Address the review"): ((options: RunOptions) => RunResult) =>
+    ({ workspace }) => {
+      for (const [path, content] of Object.entries(files)) {
+        mkdirSync(dirname(join(workspace, path)), { recursive: true });
+        writeFileSync(join(workspace, path), content);
+      }
+      return { ok: true, output: { decisions, commit_message }, log: "fix log" };
+    };
+  const phaseNames = async (attempt: any) => attempt.phases.map((p: any) => p.name);
+  const phase = (attempt: any, name: string) => attempt.phases.find((p: any) => p.name === name);
+
+  test("the two axes run as fresh sessions built from the code-review skill; the Standards prompt carries the standards and the smell rules, the Spec prompt the brief and the issue", async () => {
+    const { harness } = await ready();
+    t.github.bodies.set("octo/app#1", "The widget crashes on empty input.");
+    harness.script = [discovered(), ...solved()];
+    await t.app.work();
+
+    const standards = harness.runs[3]!;
+    const spec = harness.runs[4]!;
+    expect(standards.prompt).toContain(skillBody);
+    expect(standards.prompt).toContain("The repo wins");
+    expect(standards.prompt).toContain("Smells are opinions");
+    expect(standards.prompt).toContain("possible <smell>");
+    expect(standards.prompt).toContain(CONVENTIONS.notes);
+    expect(standards.timeoutMs).toBe(REVIEW_TIMEOUT_MS);
+    expect(standards.schema.required).toEqual(["findings"]);
+
+    expect(spec.prompt).toContain(skillBody);
+    expect(spec.prompt).toContain(BRIEF.brief);
+    expect(spec.prompt).toContain("The widget crashes on empty input.");
+    expect(spec.prompt).not.toContain(STANDARD.rationale);
+  });
+
+  test("findings from both axes are fixed, the controller commits the fix, checks re-run, and a clean round ends the loop; job detail and the PR body show both", async () => {
+    const { harness } = await ready();
+    const decisions: Decision[] = [
+      { id: "S1", decision: "fixed", reason: "extracted the shared expression" },
+      { id: "P1", decision: "rejected", reason: "the brief does not ask for that" },
+    ];
+    harness.script = [
+      discovered(),
+      briefed(),
+      implemented(),
+      reviewing(STANDARD),
+      reviewing(SPEC),
+      fixing({ "src/f.ts": "export const f = (n: number) => n + 1; // reviewed\n" }, decisions),
+      reviewing(),
+      reviewing(),
+    ];
+    await t.app.work();
+
+    const job = await jobFor(1);
+    const attempt = job.attempts[0];
+    expect(job.state).toBe("pr_created");
+    expect(await phaseNames(attempt)).toEqual([
+      "conventions", "brief", "implement", "red/green", "checks",
+      "review/standards", "review/spec", "fix", "checks",
+      "review/standards", "review/spec", "publish",
+    ]);
+    // The commit from the fix round is recorded and the checks ran again on it.
+    expect(attempt.commits).toMatchObject([{ message: "Make f handle 1" }, { message: "Address the review" }]);
+    expect(t.sandbox.runs.filter((r) => r.commands.includes("bun test"))).toHaveLength(2);
+    expect(phase(attempt, "review/standards").output).toEqual({ findings: [STANDARD] });
+    expect(phase(attempt, "fix").output).toEqual({ decisions, commit_message: "Address the review" });
+
+    const { body } = t.github.pulls[0]!;
+    expect(body).toContain("## Review");
+    expect(body).toContain("`S1` possible Duplicated Code: the same expression appears twice — extracted the shared expression");
+    expect(body).toContain("`P1` missing requirement: the brief asks that `f(0)` throw — the brief does not ask for that");
+  });
+
+  test("a round that fixes nothing ends the loop with no commit and no re-check", async () => {
+    const { harness } = await ready();
+    harness.script = [
+      discovered(),
+      briefed(),
+      implemented(),
+      reviewing(STANDARD),
+      reviewing(),
+      fixing({}, [{ id: "S1", decision: "rejected", reason: "not worth a change here" }]),
+    ];
+    await t.app.work();
+
+    const attempt = (await jobFor(1)).attempts[0];
+    expect((await jobFor(1)).state).toBe("pr_created");
+    expect(await phaseNames(attempt)).toEqual(["conventions", "brief", "implement", "red/green", "checks", "review/standards", "review/spec", "fix", "publish"]);
+    expect(attempt.commits).toHaveLength(1);
+    expect(t.sandbox.runs.filter((r) => r.commands.includes("bun test"))).toHaveLength(1);
+    const { body } = t.github.pulls[0]!;
+    expect(body).toContain("Rejected:");
+    expect(body).toContain("not worth a change here");
+    expect(body).not.toContain("Fixed:");
+  });
+
+  test("the loop stops after 3 rounds, leaving the third round's findings open in the PR", async () => {
+    const { harness } = await ready();
+    const fix = (content: string) => fixing({ "src/f.ts": content }, [{ id: "S1", decision: "fixed", reason: "tweaked it" }]);
+    harness.script = [
+      discovered(), briefed(), implemented(),
+      reviewing(STANDARD), reviewing(), fix("export const f = (n: number) => n + 1; // r1\n"),
+      reviewing(STANDARD), reviewing(), fix("export const f = (n: number) => n + 1; // r2\n"),
+      reviewing(STANDARD), reviewing(),
+    ];
+    await t.app.work();
+
+    const attempt = (await jobFor(1)).attempts[0];
+    expect((await jobFor(1)).state).toBe("pr_created");
+    expect(await phaseNames(attempt)).toEqual(["conventions", "brief", "implement", "red/green", "checks", "review/standards", "review/spec", "fix", "checks", "review/standards", "review/spec", "fix", "checks", "review/standards", "review/spec", "publish"]);
+    expect(attempt.commits).toHaveLength(3);
+    const { body } = t.github.pulls[0]!;
+    expect(body).toContain("Open (not fixed):");
+    expect(body).toContain("`S1` possible Duplicated Code");
+  });
+
+  test("failing checks after a fix round fail the attempt with no PR", async () => {
+    const { harness } = await ready();
+    const suite = t.sandbox.script;
+    t.sandbox.script = (command, dir) =>
+      command.startsWith("bun test") && existsSync(join(dir, "src/f.ts")) && readFileSync(join(dir, "src/f.ts"), "utf8").includes("broken")
+        ? { exitCode: 1, log: "test failed" }
+        : suite(command, dir);
+    harness.script = [
+      discovered(), briefed(), implemented(),
+      reviewing(STANDARD), reviewing(),
+      fixing({ "src/f.ts": "export const f = (n: number) => n + 1; // broken\n" }, [{ id: "S1", decision: "fixed", reason: "changed it" }]),
+    ];
+    await t.app.work();
+
+    const job = await jobFor(1);
+    expect(job.state).toBe("failed");
+    expect(job.attempts[0].result).toMatch(/^checks: `bun test` exited 1/);
+    expect(t.github.calls.some((c) => c.op === "push")).toBe(false);
+    expect(t.github.pulls).toHaveLength(0);
+  });
+
+  const invalid: Record<string, { decisions: Decision[]; message?: string; reason: string }> = {
+    "a decision for an unknown finding": { decisions: [{ id: "X", decision: "rejected", reason: "nope" }], reason: "decision X does not match a finding" },
+    "two decisions for one finding": {
+      decisions: [{ id: "S1", decision: "fixed", reason: "a" }, { id: "S1", decision: "rejected", reason: "b" }],
+      reason: "there are two decisions for S1",
+    },
+    "a rejection without a reason": { decisions: [{ id: "S1", decision: "rejected", reason: "  " }], reason: "finding S1 is rejected without a reason" },
+    "a finding with no decision": { decisions: [], reason: "finding S1 has no decision" },
+    "a fix with no commit message": { decisions: [{ id: "S1", decision: "fixed", reason: "done" }], message: "", reason: "the fixes have no commit message" },
+  };
+  for (const [name, { decisions, message, reason }] of Object.entries(invalid)) {
+    test(`${name} is rejected as bad output`, async () => {
+      const { harness } = await ready();
+      harness.script = [discovered(), briefed(), implemented(), reviewing(STANDARD), reviewing(), () => ({ ok: true, output: { decisions, commit_message: message ?? "x" }, log: "fix log" })];
+      await t.app.work();
+      const attempt = (await jobFor(1)).attempts[0];
+      expect(attempt).toMatchObject({ result: "fix: bad_output" });
+      expect(attempt.commits).toHaveLength(1);
+      expect(phase(attempt, "fix").log).toContain(reason);
+      expect(t.github.pulls).toHaveLength(0);
+    });
+  }
+
+  for (const [name, script] of [
+    ["review/standards", [discovered(), briefed(), implemented(), () => ({ ok: false, error: "timeout", log: "x" })]],
+    ["review/spec", [discovered(), briefed(), implemented(), reviewing(), () => ({ ok: false, error: "crash", log: "x" })]],
+    ["fix", [discovered(), briefed(), implemented(), reviewing(STANDARD), reviewing(), () => ({ ok: false, error: "timeout", log: "x" })]],
+  ] as const) {
+    test(`a harness error in ${name} fails the attempt naming the phase`, async () => {
+      const { harness } = await ready();
+      harness.script = script as any;
+      await t.app.work();
+      const attempt = (await jobFor(1)).attempts[0];
+      expect(attempt.result).toMatch(new RegExp(`^${name}: (timeout|crash)$`));
+      expect(attempt.commits).toHaveLength(1);
+      expect(t.github.pulls).toHaveLength(0);
+    });
+  }
+
+  test("the fix prompt lists every finding and the repository's conventions", async () => {
+    const { harness } = await ready();
+    harness.script = [discovered(), briefed(), implemented(), reviewing(STANDARD), reviewing(SPEC), fixing({}, [{ id: "S1", decision: "rejected", reason: "no" }, { id: "P1", decision: "rejected", reason: "no" }])];
+    await t.app.work();
+    const run = harness.runs[5]!;
+    expect(run.prompt).toContain(STANDARD.rationale);
+    expect(run.prompt).toContain(SPEC.rationale);
+    expect(run.prompt).toContain(CONVENTIONS.commit_style);
+    expect(run.timeoutMs).toBe(20 * 60_000);
+    expect(run.schema.required).toEqual(["decisions", "commit_message"]);
   });
 });
