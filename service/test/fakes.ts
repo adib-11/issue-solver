@@ -70,6 +70,10 @@ export class FakeGitHub implements GitHub {
   pulls: (PullRequest & { fullName: string; head: string; base: string; title: string; body: string; draft: boolean })[] = [];
   /** Runs before each push reaches the remote. */
   beforePush?: () => Promise<void> | void;
+  /** Runs after each push reaches the remote. */
+  afterPush?: () => Promise<void> | void;
+  /** Runs after createDraftPullRequest creates the PR. */
+  afterCreateDraftPullRequest?: (pr: PullRequest) => Promise<void> | void;
 
   async branchSha(installationId: number, fullName: string, branch: string) {
     this.calls.push({ op: "branchSha", args: [installationId, fullName, branch] });
@@ -81,6 +85,7 @@ export class FakeGitHub implements GitHub {
     this.calls.push({ op: "push", args: [installationId, fullName, sha, branch] });
     await this.beforePush?.();
     await $`git -C ${dir} push -q ${this.remotes.get(fullName)!} ${sha}:refs/heads/${branch}`;
+    await this.afterPush?.();
   }
 
   async findPullRequest(installationId: number, fullName: string, branch: string) {
@@ -94,6 +99,7 @@ export class FakeGitHub implements GitHub {
     const number = 100 + this.pulls.length;
     const created = { number, url: `https://github.com/${fullName}/pull/${number}`, fullName, draft: true, ...pr };
     this.pulls.push(created);
+    await this.afterCreateDraftPullRequest?.(created);
     return { number, url: created.url };
   }
 
