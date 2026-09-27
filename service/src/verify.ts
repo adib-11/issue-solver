@@ -60,9 +60,10 @@ export async function redGreen(sandbox: Sandbox, workspace: string, base: string
     error,
   });
   if (red.timedOut) return result("timeout");
+  // Setup can compile the overlaid tests; failing there is failing to compile, so every new test is red.
+  const setupFailed = !!setup && red.runs[0]!.exitCode !== 0;
   const tests = red.runs.slice(setup ? 1 : 0);
-  if (setup && red.runs[0]!.exitCode) return result(failed(red.runs[0]!, `exited ${red.runs[0]!.exitCode} on base`));
-  if (!template) return result(tests.some((r) => r.exitCode) ? null : "tautological tests: every check passes on base with the new test files");
+  if (!template) return result(setupFailed || tests.some((r) => r.exitCode) ? null : "tautological tests: every check passes on base with the new test files");
   const passing = tests.find((r) => !r.exitCode);
   if (passing) return result(`tautological test: \`${passing.command}\` passes on base`);
 

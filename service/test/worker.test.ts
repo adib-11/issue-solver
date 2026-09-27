@@ -655,7 +655,8 @@ describe("red/green and checks", () => {
     const file = "test/it's f.test.ts";
     harness.script = [discovered(), briefed(), implemented({ ...CHANGE, [file]: "x" }, { ...IMPLEMENTED, tests_added: [{ file, name: "f" }] })];
     await t.app.work();
-    expect(t.sandbox.runs[0]!.commands).toEqual([`bun test 'test/it'\\''s f.test.ts'`]);
+    const runs = (await jobFor(1)).attempts[0].phases.find((p: any) => p.name === "red/green").output.runs;
+    expect(runs[1]).toEqual({ on: "base", command: `bun test 'test/it'\\''s f.test.ts'`, exit_code: 1 });
   });
 
   test("without a single-test-file command, the full check runs on base with the new test files overlaid; a compile failure counts as red", async () => {
@@ -705,6 +706,33 @@ describe("red/green and checks", () => {
     expect(attempt.result).toEndWith("src/f.ts(1,1): error TS2322");
     expect(attempt.result.length).toBeLessThan(3000);
     expect(phase(attempt, "checks")).toMatchObject({ outcome: "failed", output: { runs: [{ exit_code: 0 }, { exit_code: 0 }, { command: "bun run typecheck", exit_code: 2 }] } });
+  });
+
+  test("a setup that fails on base, as when it compiles the new tests, counts as red; the tests must still pass on the change", async () => {
+    const { harness } = await ready();
+    const suite = t.sandbox.script;
+    t.sandbox.script = (command, dir) => (command === "bun install" && !existsSync(join(dir, "src/f.ts")) ? { exitCode: 2, log: "TS2307: Cannot find module" } : suite(command, dir));
+    harness.script = [discovered(), ...solved()];
+    await t.app.work();
+    const attempt = (await jobFor(1)).attempts[0];
+    expect(attempt.result).toContain("Pipeline ends here");
+    expect(phase(attempt, "red/green").output.runs).toEqual([
+      { on: "base", command: "bun install", exit_code: 2 },
+      { on: "head", command: "bun install", exit_code: 0 },
+      { on: "head", command: "bun test test/f.test.ts", exit_code: 0 },
+    ]);
+  });
+
+  test("a sandbox that cannot start fails the attempt and leaves no phase running", async () => {
+    const { harness } = await ready();
+    t.sandbox.script = () => {
+      throw new Error("docker: name in use");
+    };
+    harness.script = [discovered(), ...solved()];
+    await t.app.work();
+    const attempt = (await jobFor(1)).attempts[0];
+    expect(attempt.result).toMatch(/^Internal error: docker: name in use/);
+    expect(phase(attempt, "red/green")).toMatchObject({ outcome: "error", finished_at: expect.any(String) });
   });
 
   test("a failing setup fails the attempt naming it", async () => {

@@ -239,7 +239,14 @@ export function createApp(deps: { config: Config; github: GitHub; clock: Clock; 
   async function verifyPhase(claimed: Claimed, name: string, verify: () => Promise<Verified>) {
     setPhase.run(name, now(), claimed.job.id);
     const phase = startPhase.get(claimed.attemptId, name, now())!;
-    const { output, log, error } = await verify();
+    let verified: Verified;
+    try {
+      verified = await verify();
+    } catch (err) {
+      endPhase.run(now(), "error", "", null, phase.id);
+      throw err;
+    }
+    const { output, log, error } = verified;
     const outcome = output.skipped ? "skipped" : error === "timeout" ? "timeout" : error ? "failed" : "ok";
     endPhase.run(now(), outcome, capLog(redact(log)), JSON.stringify(output), phase.id);
     if (error) finish(claimed, "failed", `${name}: ${redact(error)}`);
