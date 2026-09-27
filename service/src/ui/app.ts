@@ -129,6 +129,14 @@ function renderAttempt(attempt: JobDetail["attempts"][number], number: number) {
     el("p", { class: "text-sm text-slate-600" }, "Started ", time(attempt.started_at), ...(attempt.finished_at ? [", finished ", time(attempt.finished_at)] : [])),
     el("p", { class: "my-2 break-words", textContent: attempt.result ?? "Running…" }),
     brief ? el("div", { class: "border-t border-slate-200 py-2" }, renderBrief(brief)) : null,
+    ...attempt.commits.map((commit) =>
+      el(
+        "div",
+        { class: "border-t border-slate-200 py-2" },
+        el("h4", { class: "font-medium break-words" }, el("code", { textContent: commit.sha.slice(0, 7) }), ` ${commit.message.split("\n")[0]}`),
+        pre(commit.stat),
+      ),
+    ),
     ...attempt.phases.map((phase) =>
       el(
         "details",

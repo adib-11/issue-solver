@@ -35,8 +35,12 @@ export type Attempt = {
   result: string | null;
   /** The issue as the brief phase saw it; null until the attempt takes it. */
   issue: IssueSnapshot | null;
+  /** The controller's commits on top of base_sha, oldest first. */
+  commits: Commit[];
   phases: Phase[];
 };
+
+export type Commit = { sha: string; message: string; /** git's diff stat of the commit. */ stat: string };
 
 export type IssueComment = { author: string; authorAssociation: string; body: string };
 
